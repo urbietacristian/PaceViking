@@ -2,6 +2,7 @@ package com.example.paceviking
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -23,6 +24,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -64,7 +66,7 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
 
     // Add default session if empty
     LaunchedEffect(sessions) {
-        if (sessions.isEmpty()) {
+        if (sessions?.isEmpty() == true) {
             val defaultSession = WorkoutSession(title = "Protocolo Nórdico (4x4)")
             val defaultPhases = listOf(
                 WorkoutPhase(sessionId = 0, type = PhaseType.WARM_UP, durationSeconds = 600, targetHrZone = HrZone.ZONE_2, orderIndex = 0),
@@ -119,12 +121,31 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionListScreen(
-    sessions: List<WorkoutSession>,
+    sessions: List<WorkoutSession>?,
     onStartSession: (WorkoutSession) -> Unit,
     onEditSession: (WorkoutSession) -> Unit,
     onDeleteSession: (WorkoutSession) -> Unit,
     onAddSession: () -> Unit
 ) {
+    var sessionToDelete by remember { mutableStateOf<WorkoutSession?>(null) }
+
+    sessionToDelete?.let { session ->
+        AlertDialog(
+            onDismissRequest = { sessionToDelete = null },
+            title = { Text("Eliminar sesión") },
+            text = { Text("¿Eliminar \"${session.title}\" y todas sus fases? Esta acción no se puede deshacer.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    onDeleteSession(session)
+                    sessionToDelete = null
+                }) { Text("ELIMINAR", color = Color.Red, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { sessionToDelete = null }) { Text("Cancelar") }
+            }
+        )
+    }
+
     Scaffold(
         topBar = { TopAppBar(title = { Text("PaceViking - Sesiones") }) },
         floatingActionButton = {
@@ -134,9 +155,13 @@ fun SessionListScreen(
         }
     ) { padding ->
         Column(modifier = Modifier.padding(padding).padding(horizontal = 16.dp)) {
-            if (sessions.isEmpty()) {
+            if (sessions == null) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Cargando sesiones...")
+                    CircularProgressIndicator()
+                }
+            } else if (sessions.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No hay sesiones. Pulsa + para crear una.")
                 }
             } else {
                 LazyColumn {
@@ -152,7 +177,7 @@ fun SessionListScreen(
                                 IconButton(onClick = { onEditSession(session) }) {
                                     Icon(Icons.Default.Edit, contentDescription = "Editar")
                                 }
-                                IconButton(onClick = { onDeleteSession(session) }) {
+                                IconButton(onClick = { sessionToDelete = session }) {
                                     Icon(Icons.Default.Delete, contentDescription = "Eliminar", tint = Color.Red)
                                 }
                             }
@@ -173,6 +198,8 @@ fun SessionEditorScreen(
 ) {
     var title by remember { mutableStateOf(sessionData?.first?.title ?: "") }
     var phases by remember { mutableStateOf(sessionData?.second ?: emptyList()) }
+
+    BackHandler { onCancel() }
 
     Scaffold(
         topBar = {
@@ -253,9 +280,24 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
                     value = (phase.durationSeconds / 60).toString(),
-                    onValueChange = { val m = it.toIntOrNull() ?: 0; onUpdate(phase.copy(durationSeconds = m * 60)) },
+                    onValueChange = {
+                        val m = it.toIntOrNull() ?: 0
+                        onUpdate(phase.copy(durationSeconds = m * 60 + phase.durationSeconds % 60))
+                    },
                     label = { Text("Min") },
-                    modifier = Modifier.width(100.dp),
+                    modifier = Modifier.width(80.dp),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedTextField(
+                    value = (phase.durationSeconds % 60).toString(),
+                    onValueChange = {
+                        val s = (it.toIntOrNull() ?: 0).coerceIn(0, 59)
+                        onUpdate(phase.copy(durationSeconds = (phase.durationSeconds / 60) * 60 + s))
+                    },
+                    label = { Text("Seg") },
+                    modifier = Modifier.width(80.dp),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true
                 )
@@ -280,10 +322,41 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
     val isPaused by viewModel.isPaused
     val currentIdx by viewModel.currentPhaseIndex
     val totalPhases = viewModel.currentPhases.value.size
+    var showStopDialog by remember { mutableStateOf(false) }
 
     if (currentIdx == -1 && phase == null) {
         onFinish()
         return
+    }
+
+    // Keep the screen on while the workout is running
+    val view = LocalView.current
+    DisposableEffect(Unit) {
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = false }
+    }
+
+    // System back pauses and asks instead of leaving mid-workout
+    BackHandler {
+        if (!isPaused) viewModel.pauseWorkout()
+        showStopDialog = true
+    }
+
+    if (showStopDialog) {
+        AlertDialog(
+            onDismissRequest = { showStopDialog = false },
+            title = { Text("Detener entrenamiento") },
+            text = { Text("¿Seguro que quieres detener el entrenamiento? Se perderá el progreso actual.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showStopDialog = false
+                    viewModel.resetWorkout()
+                }) { Text("DETENER", color = Color.Red, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showStopDialog = false }) { Text("Continuar") }
+            }
+        )
     }
 
     val backgroundColor = when (phase?.type) {
@@ -352,7 +425,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
             }
 
             OutlinedButton(
-                onClick = { viewModel.resetWorkout() },
+                onClick = { showStopDialog = true },
                 modifier = Modifier.weight(1f).height(64.dp),
                 border = ButtonDefaults.outlinedButtonBorder.copy(brush = androidx.compose.ui.graphics.SolidColor(Color.Red))
             ) {

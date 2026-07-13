@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -19,6 +20,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -48,13 +50,18 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         try {
             val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME)
             toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 600)
-            toneGen.release()
+            viewModelScope.launch {
+                delay(700)
+                toneGen.release()
+            }
         } catch (_: Exception) { }
     }
 
-    // Sessions from Database
-    val sessions: StateFlow<List<WorkoutSession>> = dao.getAllSessions()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    // Sessions from Database. Null until the first database emission so the UI
+    // can distinguish "loading" from "no sessions".
+    val sessions: StateFlow<List<WorkoutSession>?> = dao.getAllSessions()
+        .map<List<WorkoutSession>, List<WorkoutSession>?> { it }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     // Workout State
     private val _currentPhaseIndex = mutableIntStateOf(-1)
@@ -126,13 +133,18 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
 
     private fun startTimer() {
         timerJob?.cancel()
+        // Anchor the phase end to the real clock so late ticks (backgrounding,
+        // doze) never lose time — remaining is always recomputed from elapsedRealtime.
+        val phaseEndElapsed = SystemClock.elapsedRealtime() + _timeLeftSeconds.intValue * 1000L
         timerJob = viewModelScope.launch {
-            while (isActive && _timeLeftSeconds.intValue > 0) {
-                delay(1000)
-                _timeLeftSeconds.intValue -= 1
-            }
-            if (_timeLeftSeconds.intValue == 0) {
-                transitionToNextPhase()
+            while (isActive) {
+                val remainingMs = phaseEndElapsed - SystemClock.elapsedRealtime()
+                _timeLeftSeconds.intValue = (((remainingMs + 999) / 1000).coerceAtLeast(0)).toInt()
+                if (remainingMs <= 0) {
+                    transitionToNextPhase()
+                    break
+                }
+                delay(((remainingMs - 1) % 1000) + 1)
             }
         }
     }
