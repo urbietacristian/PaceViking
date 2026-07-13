@@ -150,6 +150,8 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // Workout Logic
+
+    /** Loads the session into the engine and shows the READY screen. */
     fun startWorkout(sessionId: Long) {
         if (!engine.beginLoading()) return
         viewModelScope.launch {
@@ -159,11 +161,18 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
                 _userMessage.value = "La sesión no tiene fases. Edítala y añade fases antes de empezar."
                 return@launch
             }
-            engine.start(phases)
-            val app = getApplication<Application>()
-            ContextCompat.startForegroundService(app, Intent(app, WorkoutService::class.java))
+            engine.load(phases)
         }
     }
+
+    /** Starts the countdown (INICIAR button) and the foreground service. */
+    fun beginWorkout() {
+        engine.begin()
+        val app = getApplication<Application>()
+        ContextCompat.startForegroundService(app, Intent(app, WorkoutService::class.java))
+    }
+
+    fun skipToNextPhase() = engine.skipToNextPhase()
 
     fun pauseWorkout() = engine.pause()
 

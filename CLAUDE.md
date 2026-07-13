@@ -48,9 +48,10 @@ Room code generation requires KSP — always build before expecting generated DA
 - **`updateSessionWithPhases` is a `@Transaction` DAO method** (not a `suspend` annotated `@Update`) — it deletes all existing phases for the session and re-inserts them. `saveSession` re-numbers `orderIndex` from list position before persisting, so stored indices are always contiguous.
 - **Timer is anchored to `SystemClock.elapsedRealtime()`** — remaining time is recomputed from the clock on every tick, so late ticks (backgrounding, doze) never lose time. Pause cancels the job; resume starts a new one from the current remaining seconds.
 - **Default session seeding is manual** — the session list's empty state shows a button that calls `viewModel.createDefaultSession()`. Nothing is auto-inserted; the user can keep the list empty.
-- **`startWorkout` guards against empty sessions and double-starts**: the engine moves IDLE → LOADING → RUNNING, and a session with no phases bounces back to IDLE with a `userMessage` (shown as a snackbar on the session list).
+- **`startWorkout` guards against empty sessions and double-starts**: the engine moves IDLE → LOADING → READY → RUNNING. Tapping a session only loads it (READY shows phase 1 with an INICIAR button); the timer and the foreground service start on `beginWorkout()`. A session with no phases bounces back to IDLE with a `userMessage` (shown as a snackbar on the session list).
 - **`saveEditor` rejects phases of 0 seconds** (snackbar in the editor). `PhaseItem` keeps raw text in local state so duration fields can be emptied while typing; the phase keeps its last valid value until a new number is entered.
 - **Release builds run R8** via AGP 9's `optimization { enable = true }`, which requires `android.r8.gradual.support=true` in `gradle.properties`.
+- **The UI is always night mode** — `PaceVikingTheme` ignores the system theme and dynamic color, and the workout screen's per-phase colors are dark backgrounds with bright accents. Do not reintroduce `isSystemInDarkTheme()`/light pastel phase backgrounds: the workout clock relies on this fixed dark palette for contrast. System bars are forced to light icons in `MainActivity.onCreate`.
 
 ### Data model
 
@@ -68,4 +69,4 @@ WorkoutSession  (id, title)
 |---|---|---|
 | default | `SessionListScreen` | List, start, edit, delete sessions; empty state offers a sample-session button |
 | `editorState != null` | `SessionEditorScreen` | Edit title + phases (state lives in the ViewModel); `PhaseItem` handles per-phase editing |
-| `workoutStatus == RUNNING` | `WorkoutScreen` | Real-time countdown; returns to the list when the workout finishes or is stopped |
+| `workoutStatus == READY \|\| RUNNING` | `WorkoutScreen` | READY shows phase 1 + INICIAR; RUNNING is the live countdown; returns to the list when the workout finishes or is stopped |

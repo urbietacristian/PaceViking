@@ -5,7 +5,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -38,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.paceviking.data.*
+import com.example.paceviking.ui.theme.DangerRed
 import com.example.paceviking.ui.theme.PaceVikingTheme
 import java.util.Locale
 
@@ -46,7 +49,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // The app is always night mode, so force light system-bar icons even
+        // when the device is in light theme.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         setContent {
             PaceVikingTheme {
                 Surface(
@@ -77,7 +85,7 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
     // The visible screen is derived from ViewModel state so it survives
     // configuration changes (rotation) along with the ViewModel itself.
     when {
-        workoutStatus == WorkoutStatus.RUNNING -> WorkoutScreen(viewModel)
+        workoutStatus == WorkoutStatus.READY || workoutStatus == WorkoutStatus.RUNNING -> WorkoutScreen(viewModel)
         editorState != null -> SessionEditorScreen(viewModel)
         else -> SessionListScreen(
             sessions = sessions,
@@ -130,7 +138,7 @@ fun SessionListScreen(
                 TextButton(onClick = {
                     onDeleteSession(session)
                     sessionToDelete = null
-                }) { Text("ELIMINAR", color = Color.Red, fontWeight = FontWeight.Bold) }
+                }) { Text("ELIMINAR", color = DangerRed, fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
                 TextButton(onClick = { sessionToDelete = null }) { Text("Cancelar") }
@@ -179,7 +187,7 @@ fun SessionListScreen(
                                     Icon(Icons.Default.Edit, contentDescription = "Editar")
                                 }
                                 IconButton(onClick = { sessionToDelete = session }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "Eliminar", tint = Color.Red)
+                                    Icon(Icons.Default.Delete, contentDescription = "Eliminar", tint = DangerRed)
                                 }
                             }
                         }
@@ -333,8 +341,12 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val isPaused by viewModel.isPaused.collectAsStateWithLifecycle()
     val currentIdx by viewModel.currentPhaseIndex.collectAsStateWithLifecycle()
     val phases by viewModel.currentPhases.collectAsStateWithLifecycle()
+    val status by viewModel.workoutStatus.collectAsStateWithLifecycle()
+    val isReady = status == WorkoutStatus.READY
     val totalPhases = phases.size
+    val nextPhase = phases.getOrNull(currentIdx + 1)
     var showStopDialog by remember { mutableStateOf(false) }
+    var showSkipDialog by remember { mutableStateOf(false) }
     var autoPausedForDialog by remember { mutableStateOf(false) }
 
     // Keep the screen on while the workout is running
@@ -344,8 +356,10 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         onDispose { view.keepScreenOn = false }
     }
 
-    // Asking to stop auto-pauses; declining resumes only if we auto-paused,
-    // so a workout the user paused manually stays paused.
+    // Asking to stop or skip auto-pauses; declining resumes only if we
+    // auto-paused, so a workout the user paused manually stays paused.
+    // Pausing under the skip dialog also prevents the phase from changing
+    // while the confirmation is on screen.
     val requestStop = {
         if (!isPaused) {
             viewModel.pauseWorkout()
@@ -358,8 +372,41 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         if (autoPausedForDialog) viewModel.resumeWorkout()
         autoPausedForDialog = false
     }
+    val requestSkip = {
+        if (!isPaused) {
+            viewModel.pauseWorkout()
+            autoPausedForDialog = true
+        }
+        showSkipDialog = true
+    }
+    val dismissSkip = {
+        showSkipDialog = false
+        if (autoPausedForDialog) viewModel.resumeWorkout()
+        autoPausedForDialog = false
+    }
 
-    BackHandler { requestStop() }
+    // While READY nothing has started, so back just leaves without asking.
+    BackHandler {
+        if (isReady) viewModel.resetWorkout() else requestStop()
+    }
+
+    if (showSkipDialog) {
+        AlertDialog(
+            onDismissRequest = dismissSkip,
+            title = { Text("Saltar fase") },
+            text = { Text("¿Saltar a ${nextPhase?.type?.name}? El tiempo restante de la fase actual se descartará.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSkipDialog = false
+                    autoPausedForDialog = false
+                    viewModel.skipToNextPhase()
+                }) { Text("SALTAR", fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = dismissSkip) { Text("Cancelar") }
+            }
+        )
+    }
 
     if (showStopDialog) {
         AlertDialog(
@@ -371,7 +418,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                     showStopDialog = false
                     autoPausedForDialog = false
                     viewModel.resetWorkout()
-                }) { Text("DETENER", color = Color.Red, fontWeight = FontWeight.Bold) }
+                }) { Text("DETENER", color = DangerRed, fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
                 TextButton(onClick = dismissStop) { Text("Continuar") }
@@ -379,27 +426,36 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         )
     }
 
+    // Night-mode palette: dark backgrounds tinted per phase, bright accents on top.
     val backgroundColor = when (phase?.type) {
-        PhaseType.WORK -> Color(0xFFFFEBEE)
-        PhaseType.RECOVERY -> Color(0xFFE8F5E9)
-        PhaseType.WARM_UP -> Color(0xFFE3F2FD)
-        PhaseType.COOL_DOWN -> Color(0xFFF3E5F5)
+        PhaseType.WORK -> Color(0xFF33120F)
+        PhaseType.RECOVERY -> Color(0xFF0E2415)
+        PhaseType.WARM_UP -> Color(0xFF0D1F30)
+        PhaseType.COOL_DOWN -> Color(0xFF261230)
         else -> MaterialTheme.colorScheme.background
     }
 
     val phaseColor = when (phase?.type) {
-        PhaseType.WORK -> Color(0xFFD32F2F)
-        PhaseType.RECOVERY -> Color(0xFF388E3C)
-        PhaseType.WARM_UP -> Color(0xFF1976D2)
-        PhaseType.COOL_DOWN -> Color(0xFF7B1FA2)
+        PhaseType.WORK -> Color(0xFFFF8A80)
+        PhaseType.RECOVERY -> Color(0xFF81C784)
+        PhaseType.WARM_UP -> Color(0xFF64B5F6)
+        PhaseType.COOL_DOWN -> Color(0xFFCE93D8)
         else -> MaterialTheme.colorScheme.onBackground
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().background(backgroundColor).systemBarsPadding().padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+    // Whole-session progress: elapsed time over total session time.
+    val totalSessionSeconds = remember(phases) { phases.sumOf { it.durationSeconds } }
+    val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.durationSeconds } +
+        ((phase?.durationSeconds ?: 0) - timeLeft)).coerceAtLeast(0)
+    val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
+    val animatedProgress by animateFloatAsState(targetValue = sessionProgress, label = "sessionProgress")
+
+    Box(modifier = Modifier.fillMaxSize().background(backgroundColor).systemBarsPadding()) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
         Text(
             text = "Fase ${currentIdx + 1} / $totalPhases",
             style = MaterialTheme.typography.labelLarge,
@@ -430,27 +486,80 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         Text(
             text = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60),
             style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
-            fontWeight = FontWeight.Thin
+            fontWeight = FontWeight.Thin,
+            color = Color(0xFFF5F5F5)
         )
 
-        Spacer(modifier = Modifier.height(80.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            Button(
-                onClick = { if (isPaused) viewModel.resumeWorkout() else viewModel.pauseWorkout() },
-                colors = ButtonDefaults.buttonColors(containerColor = if (isPaused) Color(0xFF4CAF50) else Color(0xFFFFA000)),
-                modifier = Modifier.weight(1f).height(64.dp)
-            ) {
-                Text(if (isPaused) "REANUDAR" else "PAUSA", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            }
-
-            OutlinedButton(
-                onClick = requestStop,
-                modifier = Modifier.weight(1f).height(64.dp),
-                border = ButtonDefaults.outlinedButtonBorder.copy(brush = androidx.compose.ui.graphics.SolidColor(Color.Red))
-            ) {
-                Text("DETENER", color = Color.Red, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        if (!isReady) {
+            if (nextPhase != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "Siguiente: ${nextPhase.type.name} · " +
+                            String.format(Locale.US, "%02d:%02d", nextPhase.durationSeconds / 60, nextPhase.durationSeconds % 60),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(0xFFBDBDBD)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    TextButton(onClick = requestSkip) {
+                        Text("SALTAR", fontWeight = FontWeight.Bold, color = phaseColor)
+                    }
+                }
+            } else {
+                Text(
+                    text = "Última fase",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = Color(0xFFBDBDBD)
+                )
             }
         }
+
+        Spacer(modifier = Modifier.height(40.dp))
+
+        if (isReady) {
+            Button(
+                onClick = { viewModel.beginWorkout() },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF4CAF50),
+                    contentColor = Color.Black
+                ),
+                modifier = Modifier.fillMaxWidth().height(64.dp)
+            ) {
+                Text("INICIAR", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            }
+        } else {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                Button(
+                    onClick = { if (isPaused) viewModel.resumeWorkout() else viewModel.pauseWorkout() },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isPaused) Color(0xFF4CAF50) else Color(0xFFFFA000),
+                        contentColor = Color.Black
+                    ),
+                    modifier = Modifier.weight(1f).height(64.dp)
+                ) {
+                    Text(if (isPaused) "REANUDAR" else "PAUSA", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+
+                OutlinedButton(
+                    onClick = requestStop,
+                    modifier = Modifier.weight(1f).height(64.dp),
+                    border = ButtonDefaults.outlinedButtonBorder.copy(brush = androidx.compose.ui.graphics.SolidColor(DangerRed))
+                ) {
+                    Text("DETENER", color = DangerRed, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+        }
+
+        LinearProgressIndicator(
+            progress = { animatedProgress },
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .padding(horizontal = 24.dp, vertical = 8.dp),
+            color = phaseColor,
+            trackColor = phaseColor.copy(alpha = 0.2f)
+        )
     }
 }

@@ -19,7 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-enum class WorkoutStatus { IDLE, LOADING, RUNNING }
+enum class WorkoutStatus { IDLE, LOADING, READY, RUNNING }
 
 /**
  * Process-level singleton (owned by [PaceVikingApplication]). The timer lives
@@ -74,7 +74,8 @@ class WorkoutEngine(context: Context) {
         if (_status.value == WorkoutStatus.LOADING) _status.value = WorkoutStatus.IDLE
     }
 
-    fun start(phases: List<WorkoutPhase>) {
+    /** Loads the session and shows phase 1, but does not start the timer. */
+    fun load(phases: List<WorkoutPhase>) {
         if (phases.isEmpty()) {
             abortLoading()
             return
@@ -85,8 +86,24 @@ class WorkoutEngine(context: Context) {
         _currentPhase.value = phases[0]
         _timeLeftSeconds.value = phases[0].durationSeconds
         _isPaused.value = false
+        _status.value = WorkoutStatus.READY
+    }
+
+    /** Starts the countdown of a READY workout. */
+    fun begin() {
+        if (_status.value != WorkoutStatus.READY) return
         _status.value = WorkoutStatus.RUNNING
         startTimer()
+    }
+
+    /** Discards the rest of the current phase and jumps to the next one. */
+    fun skipToNextPhase() {
+        if (_status.value != WorkoutStatus.RUNNING) return
+        if (_phaseIndex.value >= _phases.value.size - 1) return
+        timerJob?.cancel()
+        // Skipping always lands running: a paused workout resumes on the new phase.
+        _isPaused.value = false
+        transitionToNextPhase()
     }
 
     fun pause() {
