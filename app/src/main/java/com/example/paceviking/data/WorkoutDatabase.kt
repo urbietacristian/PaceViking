@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface WorkoutDao {
-    @Query("SELECT * FROM sessions")
+    @Query("SELECT * FROM sessions ORDER BY id ASC")
     fun getAllSessions(): Flow<List<WorkoutSession>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

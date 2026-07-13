@@ -37,16 +37,20 @@ Room code generation requires KSP — always build before expecting generated DA
 
 **Single-Activity MVVM** — no navigation library, no fragments.
 
-- **Screen state** is managed as a `var currentScreen by remember { mutableStateOf(Screen.SESSION_LIST) }` enum inside `MainNavigation()` (`MainActivity.kt`). Navigation is plain `when` branching — no NavHost.
-- **ViewModel** (`WorkoutViewModel`) is the only ViewModel, instantiated via `by viewModels()` in `MainActivity`. It owns both database access (Room DAO) and workout timer state (coroutine `Job`).
+- **Screen state is derived from ViewModel state** inside `MainNavigation()` (`MainActivity.kt`): `workoutStatus == RUNNING` shows `WorkoutScreen`, `editorState != null` shows `SessionEditorScreen`, otherwise `SessionListScreen`. There is no NavHost and no screen enum — closing the editor or resetting the workout navigates implicitly, and the visible screen survives configuration changes because the ViewModel does.
+- **Workout timer lives in `WorkoutEngine`**, a process-level singleton owned by `PaceVikingApplication` — NOT in the ViewModel. The engine exposes all workout state as `StateFlow`s; the ViewModel just re-exposes them to the UI. This is what lets the workout keep running when the Activity (and ViewModel) are destroyed.
+- **`WorkoutService` is a foreground service** (type `specialUse`, with a partial wakelock) started by `startWorkout` and stopped by itself when the engine returns to IDLE. It only keeps the process alive and mirrors the countdown in an ongoing notification — it contains no timer logic. Swiping the app from recents (`onTaskRemoved`) resets the engine, which stops the workout, the notification, and the service. `POST_NOTIFICATIONS` is requested (API 33+) when starting a workout; the workout starts whether or not it is granted.
+- **ViewModel** (`WorkoutViewModel`) is the only ViewModel, instantiated via `by viewModels()` in `MainActivity`. It owns database access (Room DAO), the session editor's in-progress state (`EditorState`), and one-shot snackbar messages (`userMessage`).
 - **Data layer** is in `data/`: `WorkoutModels.kt` (entities + enums), `WorkoutDatabase.kt` (DAO + singleton Room database). There is no repository layer — the ViewModel calls the DAO directly.
 
 ### Key design decisions to be aware of
 
-- **`updateSessionWithPhases` is a `@Transaction` DAO method** (not a `suspend` annotated `@Update`) — it deletes all existing phases for the session and re-inserts them. This means phase `id`s are always regenerated on save.
-- **Timer runs as a coroutine `Job`** in `viewModelScope`. Pause cancels the job; resume starts a new one from the current `_timeLeftSeconds`. There is no clock-based correction — if the process is backgrounded mid-second the tick will be late.
-- **Default session injection** happens inside a `LaunchedEffect(sessions)` in `MainNavigation` — it fires whenever the sessions `StateFlow` emits, but only inserts if the list is empty. This is the only seeding mechanism.
-- **Phase duration UI** is minutes-only (`durationSeconds / 60`). Seconds are always zeroed out when editing — a phase set to 90 seconds will display as "1" minute and be saved back as 60 seconds if re-saved without changes.
+- **`updateSessionWithPhases` is a `@Transaction` DAO method** (not a `suspend` annotated `@Update`) — it deletes all existing phases for the session and re-inserts them. `saveSession` re-numbers `orderIndex` from list position before persisting, so stored indices are always contiguous.
+- **Timer is anchored to `SystemClock.elapsedRealtime()`** — remaining time is recomputed from the clock on every tick, so late ticks (backgrounding, doze) never lose time. Pause cancels the job; resume starts a new one from the current remaining seconds.
+- **Default session seeding is manual** — the session list's empty state shows a button that calls `viewModel.createDefaultSession()`. Nothing is auto-inserted; the user can keep the list empty.
+- **`startWorkout` guards against empty sessions and double-starts**: the engine moves IDLE → LOADING → RUNNING, and a session with no phases bounces back to IDLE with a `userMessage` (shown as a snackbar on the session list).
+- **`saveEditor` rejects phases of 0 seconds** (snackbar in the editor). `PhaseItem` keeps raw text in local state so duration fields can be emptied while typing; the phase keeps its last valid value until a new number is entered.
+- **Release builds run R8** via AGP 9's `optimization { enable = true }`, which requires `android.r8.gradual.support=true` in `gradle.properties`.
 
 ### Data model
 
@@ -60,8 +64,8 @@ WorkoutSession  (id, title)
 
 ### UI screens (all in `MainActivity.kt`)
 
-| Screen (enum) | Composable | Purpose |
+| Shown when | Composable | Purpose |
 |---|---|---|
-| `SESSION_LIST` | `SessionListScreen` | List, start, edit, delete sessions |
-| `SESSION_EDITOR` | `SessionEditorScreen` | Edit title + phases; `PhaseItem` handles per-phase editing |
-| `WORKOUT` | `WorkoutScreen` | Real-time countdown; auto-navigates back when `currentPhaseIndex == -1` |
+| default | `SessionListScreen` | List, start, edit, delete sessions; empty state offers a sample-session button |
+| `editorState != null` | `SessionEditorScreen` | Edit title + phases (state lives in the ViewModel); `PhaseItem` handles per-phase editing |
+| `workoutStatus == RUNNING` | `WorkoutScreen` | Real-time countdown; returns to the list when the workout finishes or is stopped |

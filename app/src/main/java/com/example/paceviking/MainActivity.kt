@@ -1,10 +1,15 @@
 package com.example.paceviking
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,18 +29,17 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.paceviking.data.*
 import com.example.paceviking.ui.theme.PaceVikingTheme
-import kotlinx.coroutines.launch
-
-enum class Screen {
-    SESSION_LIST, SESSION_EDITOR, WORKOUT
-}
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val viewModel: WorkoutViewModel by viewModels()
@@ -58,62 +62,39 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainNavigation(viewModel: WorkoutViewModel) {
-    var currentScreen by remember { mutableStateOf(Screen.SESSION_LIST) }
-    var editingSession by remember { mutableStateOf<Pair<WorkoutSession, List<WorkoutPhase>>?>(null) }
-    val scope = rememberCoroutineScope()
+    val sessions by viewModel.sessions.collectAsStateWithLifecycle()
+    val workoutStatus by viewModel.workoutStatus.collectAsStateWithLifecycle()
+    val editorState by viewModel.editorState
+    val userMessage by viewModel.userMessage
 
-    val sessions by viewModel.sessions.collectAsState()
+    // The workout notification needs POST_NOTIFICATIONS on API 33+; the
+    // foreground service runs either way, so the workout starts regardless.
+    val context = LocalContext.current
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
 
-    // Add default session if empty
-    LaunchedEffect(sessions) {
-        if (sessions?.isEmpty() == true) {
-            val defaultSession = WorkoutSession(title = "Protocolo Nórdico (4x4)")
-            val defaultPhases = listOf(
-                WorkoutPhase(sessionId = 0, type = PhaseType.WARM_UP, durationSeconds = 600, targetHrZone = HrZone.ZONE_2, orderIndex = 0),
-                WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 1),
-                WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 2),
-                WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 3),
-                WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 4),
-                WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 5),
-                WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 6),
-                WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 7),
-                WorkoutPhase(sessionId = 0, type = PhaseType.COOL_DOWN, durationSeconds = 300, targetHrZone = HrZone.ZONE_1, orderIndex = 8)
-            )
-            viewModel.saveSession(defaultSession, defaultPhases)
-        }
-    }
-
-    when (currentScreen) {
-        Screen.SESSION_LIST -> SessionListScreen(
+    // The visible screen is derived from ViewModel state so it survives
+    // configuration changes (rotation) along with the ViewModel itself.
+    when {
+        workoutStatus == WorkoutStatus.RUNNING -> WorkoutScreen(viewModel)
+        editorState != null -> SessionEditorScreen(viewModel)
+        else -> SessionListScreen(
             sessions = sessions,
-            onStartSession = { 
-                viewModel.startWorkout(it.id)
-                currentScreen = Screen.WORKOUT 
-            },
-            onEditSession = { session ->
-                scope.launch {
-                    val phases = viewModel.getPhasesForSession(session.id)
-                    editingSession = session to phases
-                    currentScreen = Screen.SESSION_EDITOR
+            userMessage = userMessage,
+            onMessageShown = { viewModel.clearUserMessage() },
+            onStartSession = { session ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 }
+                viewModel.startWorkout(session.id)
             },
+            onEditSession = { viewModel.openEditor(it) },
             onDeleteSession = { viewModel.deleteSession(it) },
-            onAddSession = {
-                editingSession = WorkoutSession(title = "Nueva Sesión") to emptyList()
-                currentScreen = Screen.SESSION_EDITOR
-            }
-        )
-        Screen.SESSION_EDITOR -> SessionEditorScreen(
-            sessionData = editingSession,
-            onSave = { session, phases ->
-                viewModel.saveSession(session, phases)
-                currentScreen = Screen.SESSION_LIST
-            },
-            onCancel = { currentScreen = Screen.SESSION_LIST }
-        )
-        Screen.WORKOUT -> WorkoutScreen(
-            viewModel = viewModel,
-            onFinish = { currentScreen = Screen.SESSION_LIST }
+            onAddSession = { viewModel.openEditorForNew() },
+            onCreateDefaultSession = { viewModel.createDefaultSession() }
         )
     }
 }
@@ -122,12 +103,23 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
 @Composable
 fun SessionListScreen(
     sessions: List<WorkoutSession>?,
+    userMessage: String?,
+    onMessageShown: () -> Unit,
     onStartSession: (WorkoutSession) -> Unit,
     onEditSession: (WorkoutSession) -> Unit,
     onDeleteSession: (WorkoutSession) -> Unit,
-    onAddSession: () -> Unit
+    onAddSession: () -> Unit,
+    onCreateDefaultSession: () -> Unit
 ) {
     var sessionToDelete by remember { mutableStateOf<WorkoutSession?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(userMessage) {
+        userMessage?.let {
+            snackbarHostState.showSnackbar(it)
+            onMessageShown()
+        }
+    }
 
     sessionToDelete?.let { session ->
         AlertDialog(
@@ -148,6 +140,7 @@ fun SessionListScreen(
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("PaceViking - Sesiones") }) },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             FloatingActionButton(onClick = onAddSession) {
                 Icon(Icons.Default.Add, contentDescription = "Añadir Sesión")
@@ -160,8 +153,16 @@ fun SessionListScreen(
                     CircularProgressIndicator()
                 }
             } else if (sessions.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
                     Text("No hay sesiones. Pulsa + para crear una.")
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedButton(onClick = onCreateDefaultSession) {
+                        Text("Añadir sesión de ejemplo (Protocolo Nórdico 4x4)")
+                    }
                 }
             } else {
                 LazyColumn {
@@ -191,27 +192,32 @@ fun SessionListScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SessionEditorScreen(
-    sessionData: Pair<WorkoutSession, List<WorkoutPhase>>?,
-    onSave: (WorkoutSession, List<WorkoutPhase>) -> Unit,
-    onCancel: () -> Unit
-) {
-    var title by remember { mutableStateOf(sessionData?.first?.title ?: "") }
-    var phases by remember { mutableStateOf(sessionData?.second ?: emptyList()) }
+fun SessionEditorScreen(viewModel: WorkoutViewModel) {
+    val editor = viewModel.editorState.value ?: return
+    val userMessage by viewModel.userMessage
+    val snackbarHostState = remember { SnackbarHostState() }
 
-    BackHandler { onCancel() }
+    LaunchedEffect(userMessage) {
+        userMessage?.let {
+            snackbarHostState.showSnackbar(it)
+            viewModel.clearUserMessage()
+        }
+    }
+
+    BackHandler { viewModel.cancelEditor() }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text("Editar Sesión") },
                 navigationIcon = {
-                    IconButton(onClick = onCancel) {
+                    IconButton(onClick = { viewModel.cancelEditor() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Volver")
                     }
                 },
                 actions = {
-                    TextButton(onClick = { onSave(sessionData!!.first.copy(title = title), phases) }) {
+                    TextButton(onClick = { viewModel.saveEditor() }) {
                         Text("GUARDAR", fontWeight = FontWeight.Bold)
                     }
                 }
@@ -220,34 +226,24 @@ fun SessionEditorScreen(
     ) { padding ->
         Column(modifier = Modifier.padding(padding).padding(16.dp).verticalScroll(rememberScrollState())) {
             OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
+                value = editor.title,
+                onValueChange = { viewModel.updateEditorTitle(it) },
                 label = { Text("Título de la Sesión") },
                 modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
             )
 
             Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
-            
-            phases.forEachIndexed { index, phase ->
+
+            editor.phases.forEachIndexed { index, phase ->
                 PhaseItem(
                     phase = phase,
-                    onRemove = { phases = phases.filterIndexed { i, _ -> i != index } },
-                    onUpdate = { updated -> 
-                        phases = phases.mapIndexed { i, p -> if (i == index) updated else p }
-                    }
+                    onRemove = { viewModel.removeEditorPhase(index) },
+                    onUpdate = { updated -> viewModel.updateEditorPhase(index, updated) }
                 )
             }
 
             Button(
-                onClick = { 
-                    phases = phases + WorkoutPhase(
-                        sessionId = sessionData?.first?.id ?: 0, 
-                        type = PhaseType.WORK, 
-                        durationSeconds = 60, 
-                        targetHrZone = HrZone.NONE, 
-                        orderIndex = phases.size
-                    ) 
-                },
+                onClick = { viewModel.addEditorPhase() },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
             ) {
                 Icon(Icons.Default.Add, contentDescription = null)
@@ -260,29 +256,41 @@ fun SessionEditorScreen(
 
 @Composable
 fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase) -> Unit) {
+    val minutes = phase.durationSeconds / 60
+    val seconds = phase.durationSeconds % 60
+    // Raw text as local state so the fields can be emptied while typing; keyed
+    // to the phase value so external changes (item reuse after a deletion)
+    // re-sync the text. The phase keeps its last valid duration until a new
+    // number is typed.
+    var minutesText by remember(minutes) { mutableStateOf(minutes.toString()) }
+    var secondsText by remember(seconds) { mutableStateOf(seconds.toString()) }
+
     Card(modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 // Phase Type Toggle
                 Text(
-                    text = phase.type.name, 
+                    text = phase.type.name,
                     modifier = Modifier.weight(1f).clickable {
-                        val nextType = PhaseType.values()[(phase.type.ordinal + 1) % PhaseType.values().size]
+                        val nextType = PhaseType.entries[(phase.type.ordinal + 1) % PhaseType.entries.size]
                         onUpdate(phase.copy(type = nextType))
                     },
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
-                IconButton(onClick = onRemove) { 
-                    Icon(Icons.Default.Delete, contentDescription = "Eliminar fase", tint = Color.Gray) 
+                IconButton(onClick = onRemove) {
+                    Icon(Icons.Default.Delete, contentDescription = "Eliminar fase", tint = Color.Gray)
                 }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
-                    value = (phase.durationSeconds / 60).toString(),
-                    onValueChange = {
-                        val m = it.toIntOrNull() ?: 0
-                        onUpdate(phase.copy(durationSeconds = m * 60 + phase.durationSeconds % 60))
+                    value = minutesText,
+                    onValueChange = { input ->
+                        val filtered = input.filter { it.isDigit() }.take(3)
+                        minutesText = filtered
+                        filtered.toIntOrNull()?.let { m ->
+                            onUpdate(phase.copy(durationSeconds = m * 60 + seconds))
+                        }
                     },
                     label = { Text("Min") },
                     modifier = Modifier.width(80.dp),
@@ -291,10 +299,13 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 OutlinedTextField(
-                    value = (phase.durationSeconds % 60).toString(),
-                    onValueChange = {
-                        val s = (it.toIntOrNull() ?: 0).coerceIn(0, 59)
-                        onUpdate(phase.copy(durationSeconds = (phase.durationSeconds / 60) * 60 + s))
+                    value = secondsText,
+                    onValueChange = { input ->
+                        val filtered = input.filter { it.isDigit() }.take(2)
+                        secondsText = filtered
+                        filtered.toIntOrNull()?.let { s ->
+                            onUpdate(phase.copy(durationSeconds = minutes * 60 + s.coerceIn(0, 59)))
+                        }
                     },
                     label = { Text("Seg") },
                     modifier = Modifier.width(80.dp),
@@ -303,8 +314,8 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
                 )
                 Spacer(modifier = Modifier.width(16.dp))
                 // HR Zone selector
-                Column(modifier = Modifier.clickable { 
-                    val nextZone = HrZone.values()[(phase.targetHrZone.ordinal + 1) % HrZone.values().size]
+                Column(modifier = Modifier.clickable {
+                    val nextZone = HrZone.entries[(phase.targetHrZone.ordinal + 1) % HrZone.entries.size]
                     onUpdate(phase.copy(targetHrZone = nextZone))
                 }) {
                     Text("Zona Cardíaca", style = MaterialTheme.typography.labelSmall)
@@ -316,18 +327,15 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
 }
 
 @Composable
-fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
-    val phase by viewModel.currentPhase
-    val timeLeft by viewModel.timeLeftSeconds
-    val isPaused by viewModel.isPaused
-    val currentIdx by viewModel.currentPhaseIndex
-    val totalPhases = viewModel.currentPhases.value.size
+fun WorkoutScreen(viewModel: WorkoutViewModel) {
+    val phase by viewModel.currentPhase.collectAsStateWithLifecycle()
+    val timeLeft by viewModel.timeLeftSeconds.collectAsStateWithLifecycle()
+    val isPaused by viewModel.isPaused.collectAsStateWithLifecycle()
+    val currentIdx by viewModel.currentPhaseIndex.collectAsStateWithLifecycle()
+    val phases by viewModel.currentPhases.collectAsStateWithLifecycle()
+    val totalPhases = phases.size
     var showStopDialog by remember { mutableStateOf(false) }
-
-    if (currentIdx == -1 && phase == null) {
-        onFinish()
-        return
-    }
+    var autoPausedForDialog by remember { mutableStateOf(false) }
 
     // Keep the screen on while the workout is running
     val view = LocalView.current
@@ -336,25 +344,37 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
         onDispose { view.keepScreenOn = false }
     }
 
-    // System back pauses and asks instead of leaving mid-workout
-    BackHandler {
-        if (!isPaused) viewModel.pauseWorkout()
+    // Asking to stop auto-pauses; declining resumes only if we auto-paused,
+    // so a workout the user paused manually stays paused.
+    val requestStop = {
+        if (!isPaused) {
+            viewModel.pauseWorkout()
+            autoPausedForDialog = true
+        }
         showStopDialog = true
     }
+    val dismissStop = {
+        showStopDialog = false
+        if (autoPausedForDialog) viewModel.resumeWorkout()
+        autoPausedForDialog = false
+    }
+
+    BackHandler { requestStop() }
 
     if (showStopDialog) {
         AlertDialog(
-            onDismissRequest = { showStopDialog = false },
+            onDismissRequest = dismissStop,
             title = { Text("Detener entrenamiento") },
             text = { Text("¿Seguro que quieres detener el entrenamiento? Se perderá el progreso actual.") },
             confirmButton = {
                 TextButton(onClick = {
                     showStopDialog = false
+                    autoPausedForDialog = false
                     viewModel.resetWorkout()
                 }) { Text("DETENER", color = Color.Red, fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
-                TextButton(onClick = { showStopDialog = false }) { Text("Continuar") }
+                TextButton(onClick = dismissStop) { Text("Continuar") }
             }
         )
     }
@@ -376,7 +396,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().background(backgroundColor).padding(24.dp),
+        modifier = Modifier.fillMaxSize().background(backgroundColor).systemBarsPadding().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -408,7 +428,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
         Spacer(modifier = Modifier.height(64.dp))
 
         Text(
-            text = String.format("%02d:%02d", timeLeft / 60, timeLeft % 60),
+            text = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60),
             style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
             fontWeight = FontWeight.Thin
         )
@@ -425,7 +445,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel, onFinish: () -> Unit) {
             }
 
             OutlinedButton(
-                onClick = { showStopDialog = true },
+                onClick = requestStop,
                 modifier = Modifier.weight(1f).height(64.dp),
                 border = ButtonDefaults.outlinedButtonBorder.copy(brush = androidx.compose.ui.graphics.SolidColor(Color.Red))
             ) {

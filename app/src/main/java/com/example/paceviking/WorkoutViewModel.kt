@@ -1,61 +1,31 @@
 package com.example.paceviking
 
 import android.app.Application
-import android.content.Context
-import android.media.AudioManager
-import android.media.ToneGenerator
-import android.os.Build
-import android.os.SystemClock
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
+import android.content.Intent
 import androidx.compose.runtime.State
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.paceviking.data.*
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+
+data class EditorState(
+    val session: WorkoutSession,
+    val title: String,
+    val phases: List<WorkoutPhase>
+)
 
 class WorkoutViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = WorkoutDatabase.getDatabase(application)
     private val dao = db.workoutDao()
-
-    @Suppress("DEPRECATION")
-    private val vibrator: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        (application.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-    } else {
-        application.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-    }
-
-    private fun alertPhaseChange() {
-        // Three short pulses: 0ms delay, 100ms on, 100ms off, 100ms on, 100ms off, 100ms on
-        val pattern = longArrayOf(0, 100, 100, 100, 100, 100)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(pattern, -1)
-        }
-
-        try {
-            val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME)
-            toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 600)
-            viewModelScope.launch {
-                delay(700)
-                toneGen.release()
-            }
-        } catch (_: Exception) { }
-    }
+    private val engine = (application as PaceVikingApplication).workoutEngine
 
     // Sessions from Database. Null until the first database emission so the UI
     // can distinguish "loading" from "no sessions".
@@ -63,28 +33,44 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         .map<List<WorkoutSession>, List<WorkoutSession>?> { it }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
-    // Workout State
-    private val _currentPhaseIndex = mutableIntStateOf(-1)
-    val currentPhaseIndex: State<Int> = _currentPhaseIndex
+    // Workout state is owned by the process-level WorkoutEngine; re-exposed for the UI.
+    val workoutStatus: StateFlow<WorkoutStatus> = engine.status
+    val currentPhases: StateFlow<List<WorkoutPhase>> = engine.phases
+    val currentPhaseIndex: StateFlow<Int> = engine.phaseIndex
+    val currentPhase: StateFlow<WorkoutPhase?> = engine.currentPhase
+    val timeLeftSeconds: StateFlow<Int> = engine.timeLeftSeconds
+    val isPaused: StateFlow<Boolean> = engine.isPaused
 
-    private val _currentPhases = mutableStateOf<List<WorkoutPhase>>(emptyList())
-    val currentPhases: State<List<WorkoutPhase>> = _currentPhases
+    // Editor state lives here (not in the composable) so in-progress edits
+    // survive configuration changes like rotation.
+    private val _editorState = mutableStateOf<EditorState?>(null)
+    val editorState: State<EditorState?> = _editorState
 
-    private val _currentPhase = mutableStateOf<WorkoutPhase?>(null)
-    val currentPhase: State<WorkoutPhase?> = _currentPhase
+    // One-shot message shown as a snackbar.
+    private val _userMessage = mutableStateOf<String?>(null)
+    val userMessage: State<String?> = _userMessage
 
-    private val _timeLeftSeconds = mutableIntStateOf(0)
-    val timeLeftSeconds: State<Int> = _timeLeftSeconds
+    init {
+        viewModelScope.launch {
+            engine.completed.collect { completed ->
+                if (completed) {
+                    _userMessage.value = "¡Entrenamiento completado!"
+                    engine.acknowledgeCompletion()
+                }
+            }
+        }
+    }
 
-    private val _isPaused = mutableStateOf(false)
-    val isPaused: State<Boolean> = _isPaused
-
-    private var timerJob: Job? = null
+    fun clearUserMessage() {
+        _userMessage.value = null
+    }
 
     // Session Management
     fun saveSession(session: WorkoutSession, phases: List<WorkoutPhase>) {
         viewModelScope.launch {
-            dao.updateSessionWithPhases(session, phases)
+            // Re-number orderIndex from list position: deletes/adds in the editor
+            // can leave duplicate indices, making the persisted order unstable.
+            dao.updateSessionWithPhases(session, phases.mapIndexed { i, p -> p.copy(orderIndex = i) })
         }
     }
 
@@ -94,73 +80,94 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    suspend fun getPhasesForSession(sessionId: Long): List<WorkoutPhase> {
-        return dao.getPhasesForSession(sessionId).first()
+    fun createDefaultSession() {
+        val defaultSession = WorkoutSession(title = "Protocolo Nórdico (4x4)")
+        val defaultPhases = listOf(
+            WorkoutPhase(sessionId = 0, type = PhaseType.WARM_UP, durationSeconds = 600, targetHrZone = HrZone.ZONE_2, orderIndex = 0),
+            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 1),
+            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 2),
+            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 3),
+            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 4),
+            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 5),
+            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 6),
+            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 7),
+            WorkoutPhase(sessionId = 0, type = PhaseType.COOL_DOWN, durationSeconds = 300, targetHrZone = HrZone.ZONE_1, orderIndex = 8)
+        )
+        saveSession(defaultSession, defaultPhases)
+    }
+
+    // Editor
+    fun openEditor(session: WorkoutSession) {
+        viewModelScope.launch {
+            val phases = dao.getPhasesForSession(session.id).first()
+            _editorState.value = EditorState(session, session.title, phases)
+        }
+    }
+
+    fun openEditorForNew() {
+        val session = WorkoutSession(title = "Nueva Sesión")
+        _editorState.value = EditorState(session, session.title, emptyList())
+    }
+
+    fun updateEditorTitle(title: String) {
+        _editorState.value = _editorState.value?.copy(title = title)
+    }
+
+    fun updateEditorPhase(index: Int, phase: WorkoutPhase) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(phases = editor.phases.mapIndexed { i, p -> if (i == index) phase else p })
+    }
+
+    fun removeEditorPhase(index: Int) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(phases = editor.phases.filterIndexed { i, _ -> i != index })
+    }
+
+    fun addEditorPhase() {
+        val editor = _editorState.value ?: return
+        val newPhase = WorkoutPhase(
+            sessionId = editor.session.id,
+            type = PhaseType.WORK,
+            durationSeconds = 60,
+            targetHrZone = HrZone.NONE,
+            orderIndex = editor.phases.size
+        )
+        _editorState.value = editor.copy(phases = editor.phases + newPhase)
+    }
+
+    fun saveEditor() {
+        val editor = _editorState.value ?: return
+        if (editor.phases.any { it.durationSeconds <= 0 }) {
+            _userMessage.value = "Cada fase debe durar al menos 1 segundo."
+            return
+        }
+        saveSession(editor.session.copy(title = editor.title), editor.phases)
+        _editorState.value = null
+    }
+
+    fun cancelEditor() {
+        _editorState.value = null
     }
 
     // Workout Logic
     fun startWorkout(sessionId: Long) {
+        if (!engine.beginLoading()) return
         viewModelScope.launch {
             val phases = dao.getPhasesForSession(sessionId).first()
-            if (phases.isNotEmpty()) {
-                _currentPhases.value = phases
-                _currentPhaseIndex.intValue = 0
-                _currentPhase.value = phases[0]
-                _timeLeftSeconds.intValue = phases[0].durationSeconds
-                _isPaused.value = false
-                startTimer()
+            if (phases.isEmpty()) {
+                engine.abortLoading()
+                _userMessage.value = "La sesión no tiene fases. Edítala y añade fases antes de empezar."
+                return@launch
             }
+            engine.start(phases)
+            val app = getApplication<Application>()
+            ContextCompat.startForegroundService(app, Intent(app, WorkoutService::class.java))
         }
     }
 
-    fun pauseWorkout() {
-        _isPaused.value = true
-        timerJob?.cancel()
-    }
+    fun pauseWorkout() = engine.pause()
 
-    fun resumeWorkout() {
-        _isPaused.value = false
-        startTimer()
-    }
+    fun resumeWorkout() = engine.resume()
 
-    fun resetWorkout() {
-        timerJob?.cancel()
-        _currentPhaseIndex.intValue = -1
-        _currentPhase.value = null
-        _timeLeftSeconds.intValue = 0
-        _isPaused.value = false
-    }
-
-    private fun startTimer() {
-        timerJob?.cancel()
-        // Anchor the phase end to the real clock so late ticks (backgrounding,
-        // doze) never lose time — remaining is always recomputed from elapsedRealtime.
-        val phaseEndElapsed = SystemClock.elapsedRealtime() + _timeLeftSeconds.intValue * 1000L
-        timerJob = viewModelScope.launch {
-            while (isActive) {
-                val remainingMs = phaseEndElapsed - SystemClock.elapsedRealtime()
-                _timeLeftSeconds.intValue = (((remainingMs + 999) / 1000).coerceAtLeast(0)).toInt()
-                if (remainingMs <= 0) {
-                    transitionToNextPhase()
-                    break
-                }
-                delay(((remainingMs - 1) % 1000) + 1)
-            }
-        }
-    }
-
-    private fun transitionToNextPhase() {
-        alertPhaseChange()
-        val nextIndex = _currentPhaseIndex.intValue + 1
-        if (nextIndex < _currentPhases.value.size) {
-            _currentPhaseIndex.intValue = nextIndex
-            val nextPhase = _currentPhases.value[nextIndex]
-            _currentPhase.value = nextPhase
-            _timeLeftSeconds.intValue = nextPhase.durationSeconds
-            startTimer()
-        } else {
-            // Finished
-            resetWorkout()
-        }
-    }
+    fun resetWorkout() = engine.reset()
 }
