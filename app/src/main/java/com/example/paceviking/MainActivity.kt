@@ -272,6 +272,11 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
     // number is typed.
     var minutesText by remember(minutes) { mutableStateOf(minutes.toString()) }
     var secondsText by remember(seconds) { mutableStateOf(seconds.toString()) }
+    // The speed's canonical text (whole numbers without ".0") matches what the
+    // filter lets the user type, so the keyed re-sync doesn't fight the cursor.
+    var speedText by remember(phase.speedKmh) {
+        mutableStateOf(phase.speedKmh?.let { formatSpeedForEditor(it) } ?: "")
+    }
 
     Card(modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
@@ -330,9 +335,37 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
                     Text(phase.targetHrZone.name, fontWeight = FontWeight.Medium)
                 }
             }
+            OutlinedTextField(
+                value = speedText,
+                onValueChange = { input ->
+                    val filtered = filterSpeedInput(input)
+                    speedText = filtered
+                    // Blank (or a lone ".") means "no recommendation".
+                    onUpdate(phase.copy(speedKmh = filtered.toDoubleOrNull()))
+                },
+                label = { Text("Velocidad (km/h)") },
+                placeholder = { Text("Opcional") },
+                modifier = Modifier.width(160.dp).padding(top = 8.dp),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                singleLine = true
+            )
         }
     }
 }
+
+// Speed input allows up to 2 integer digits, one dot and one decimal (max 25.0).
+private fun filterSpeedInput(input: String): String {
+    val cleaned = input.filter { it.isDigit() || it == '.' }
+    val dot = cleaned.indexOf('.')
+    return if (dot == -1) cleaned.take(2)
+    else cleaned.take(dot).take(2) + "." + cleaned.drop(dot + 1).filter { it.isDigit() }.take(1)
+}
+
+// Whole numbers render without ".0" so the text matches what was typed.
+private fun formatSpeedForEditor(speed: Double): String =
+    if (speed % 1.0 == 0.0) speed.toInt().toString() else String.format(Locale.US, "%.1f", speed)
+
+private fun formatSpeedKmh(speed: Double): String = String.format(Locale.US, "%.1f km/h", speed)
 
 @Composable
 fun WorkoutScreen(viewModel: WorkoutViewModel) {
@@ -481,6 +514,21 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
             )
         }
 
+        phase?.speedKmh?.let { speed ->
+            Surface(
+                color = phaseColor.copy(alpha = 0.1f),
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.padding(top = 8.dp)
+            ) {
+                Text(
+                    text = "Velocidad: ${formatSpeedKmh(speed)}",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = phaseColor,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.height(64.dp))
 
         Text(
@@ -495,12 +543,23 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         if (!isReady) {
             if (nextPhase != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "Siguiente: ${nextPhase.type.name} · " +
-                            String.format(Locale.US, "%02d:%02d", nextPhase.durationSeconds / 60, nextPhase.durationSeconds % 60),
-                        style = MaterialTheme.typography.titleMedium,
-                        color = Color(0xFFBDBDBD)
-                    )
+                    // The speed goes on its own row so the SALTAR button never
+                    // gets squeezed by a long single-line summary.
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "Siguiente: ${nextPhase.type.name} · " +
+                                String.format(Locale.US, "%02d:%02d", nextPhase.durationSeconds / 60, nextPhase.durationSeconds % 60),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color(0xFFBDBDBD)
+                        )
+                        nextPhase.speedKmh?.let { speed ->
+                            Text(
+                                text = formatSpeedKmh(speed),
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color(0xFFBDBDBD)
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.width(8.dp))
                     TextButton(onClick = requestSkip) {
                         Text("SALTAR", fontWeight = FontWeight.Bold, color = phaseColor)

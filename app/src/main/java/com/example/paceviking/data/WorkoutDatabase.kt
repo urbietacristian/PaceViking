@@ -2,6 +2,8 @@ package com.example.paceviking.data
 
 import android.content.Context
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -32,11 +34,17 @@ interface WorkoutDao {
     }
 }
 
-@Database(entities = [WorkoutSession::class, WorkoutPhase::class], version = 1)
+@Database(entities = [WorkoutSession::class, WorkoutPhase::class], version = 2)
 abstract class WorkoutDatabase : RoomDatabase() {
     abstract fun workoutDao(): WorkoutDao
 
     companion object {
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE phases ADD COLUMN speedKmh REAL")
+            }
+        }
+
         @Volatile
         private var INSTANCE: WorkoutDatabase? = null
 
@@ -46,7 +54,7 @@ abstract class WorkoutDatabase : RoomDatabase() {
                     context.applicationContext,
                     WorkoutDatabase::class.java,
                     "workout_database"
-                ).build()
+                ).addMigrations(MIGRATION_1_2).build()
                 INSTANCE = instance
                 instance
             }

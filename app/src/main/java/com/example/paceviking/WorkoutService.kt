@@ -58,8 +58,9 @@ class WorkoutService : Service() {
                         null
                     } else {
                         val time = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60)
+                        val speed = phase.speedKmh?.let { String.format(Locale.US, " · %.1f km/h", it) } ?: ""
                         val title = "${phase.type.name} — fase ${index + 1}/${engine.phases.value.size}"
-                        title to if (paused) "$time (en pausa)" else time
+                        title to if (paused) "$time$speed (en pausa)" else "$time$speed"
                     }
                 }.collect { content ->
                     if (content == null) {

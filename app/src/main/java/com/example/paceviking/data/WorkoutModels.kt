@@ -35,7 +35,9 @@ data class WorkoutPhase(
     val type: PhaseType,
     val durationSeconds: Int,
     val targetHrZone: HrZone,
-    val orderIndex: Int
+    val orderIndex: Int,
+    // Recommended treadmill speed in km/h (one decimal); null = no recommendation.
+    val speedKmh: Double? = null
 )
 
 data class SessionWithPhases(

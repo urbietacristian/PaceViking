@@ -141,6 +141,10 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
             _userMessage.value = "Cada fase debe durar al menos 1 segundo."
             return
         }
+        if (editor.phases.any { (it.speedKmh ?: 0.0) !in 0.0..25.0 }) {
+            _userMessage.value = "La velocidad debe estar entre 0.0 y 25.0 km/h."
+            return
+        }
         saveSession(editor.session.copy(title = editor.title), editor.phases)
         _editorState.value = null
     }
