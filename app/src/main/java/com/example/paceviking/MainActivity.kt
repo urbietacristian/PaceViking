@@ -99,7 +99,7 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
                 ) {
                     notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 }
-                viewModel.startWorkout(session.id)
+                viewModel.startWorkout(session)
             },
             onEditSession = { viewModel.openEditor(it) },
             onDeleteSession = { viewModel.deleteSession(it) },

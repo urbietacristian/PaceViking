@@ -13,12 +13,16 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.example.paceviking.data.HrZone
+import com.example.paceviking.data.WorkoutPhase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 /**
@@ -64,12 +68,31 @@ class WorkoutService : Service() {
                     }
                 }.collect { content ->
                     if (content == null) {
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        nm.cancel(PHASE_NOTIFICATION_ID)
                         ServiceCompat.stopForeground(this@WorkoutService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                         stopSelf()
                     } else {
                         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                         nm.notify(NOTIFICATION_ID, buildNotification(content.first, content.second))
                     }
+                }
+            }
+            scope.launch {
+                engine.phaseChanges.collect { (index, phase) ->
+                    if (!(application as PaceVikingApplication).isInForeground) {
+                        showPhaseChangeNotification(index, phase, engine.phases.value.size)
+                    }
+                }
+            }
+            scope.launch {
+                // Posted regardless of foreground state: it's the record of the
+                // finished session, and it survives the service stopping. The
+                // engine emits this before resetting to IDLE, so it lands
+                // before the collector above tears the service down.
+                engine.sessionCompletions.collect { info ->
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(COMPLETED_NOTIFICATION_ID, buildCompletedNotification(info))
                 }
             }
         }
@@ -117,19 +140,83 @@ class WorkoutService : Service() {
             .build()
     }
 
+    /**
+     * Heads-up notification announcing the phase the workout just moved into,
+     * shown only while the app is backgrounded. The engine already vibrates
+     * and beeps on every transition, so the channel itself is silent — the
+     * HIGH importance is what makes it pop over other apps.
+     */
+    private fun showPhaseChangeNotification(index: Int, phase: WorkoutPhase, totalPhases: Int) {
+        val duration = String.format(
+            Locale.US, "%02d:%02d", phase.durationSeconds / 60, phase.durationSeconds % 60
+        )
+        val details = buildList {
+            add(duration)
+            if (phase.targetHrZone != HrZone.NONE) add(phase.targetHrZone.name.replace("ZONE_", "Zona "))
+            phase.speedKmh?.let { add(String.format(Locale.US, "%.1f km/h", it)) }
+        }.joinToString(" · ")
+
+        val notification = alertNotificationBuilder()
+            .setContentTitle("Nueva fase: ${phase.type.name} (${index + 1}/$totalPhases)")
+            .setContentText(details)
+            .build()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Cancel first so each phase change posts a brand-new notification,
+        // which re-triggers the heads-up popup instead of silently updating.
+        nm.cancel(PHASE_NOTIFICATION_ID)
+        nm.notify(PHASE_NOTIFICATION_ID, notification)
+    }
+
+    private fun buildCompletedNotification(info: CompletedWorkoutInfo): Notification {
+        val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
+        val start = timeFormat.format(Date(info.startedAtMillis))
+        val end = timeFormat.format(Date(info.endedAtMillis))
+        return alertNotificationBuilder()
+            .setContentTitle("Sesión finalizada: ${info.sessionTitle}")
+            .setContentText("Inicio $start · Fin $end")
+            // The record should outlive taps and re-entering the app; only an
+            // explicit swipe dismisses it.
+            .setAutoCancel(false)
+            .build()
+    }
+
+    private fun alertNotificationBuilder(): NotificationCompat.Builder {
+        val contentIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(this, PHASE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentIntent(contentIntent)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_WORKOUT)
+            .setAutoCancel(true)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Entrenamiento en curso", NotificationManager.IMPORTANCE_LOW
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Entrenamiento en curso", NotificationManager.IMPORTANCE_LOW)
             )
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(channel)
+            nm.createNotificationChannel(
+                NotificationChannel(
+                    PHASE_CHANNEL_ID, "Avisos del entrenamiento", NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    // The engine handles sound/vibration on phase change.
+                    setSound(null, null)
+                    enableVibration(false)
+                }
+            )
         }
     }
 
     companion object {
         private const val CHANNEL_ID = "workout"
-        private const val NOTIFICATION_ID = 1
+        private const val PHASE_CHANNEL_ID = "workout_phase"
+        internal const val NOTIFICATION_ID = 1
+        internal const val PHASE_NOTIFICATION_ID = 2
+        internal const val COMPLETED_NOTIFICATION_ID = 3
         private const val MAX_WAKELOCK_MS = 3 * 60 * 60 * 1000L
     }
 }

@@ -156,16 +156,16 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     // Workout Logic
 
     /** Loads the session into the engine and shows the READY screen. */
-    fun startWorkout(sessionId: Long) {
+    fun startWorkout(session: WorkoutSession) {
         if (!engine.beginLoading()) return
         viewModelScope.launch {
-            val phases = dao.getPhasesForSession(sessionId).first()
+            val phases = dao.getPhasesForSession(session.id).first()
             if (phases.isEmpty()) {
                 engine.abortLoading()
                 _userMessage.value = "La sesión no tiene fases. Edítala y añade fases antes de empezar."
                 return@launch
             }
-            engine.load(phases)
+            engine.load(session.title, phases)
         }
     }
 

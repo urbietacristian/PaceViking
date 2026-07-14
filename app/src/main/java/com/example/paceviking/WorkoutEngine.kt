@@ -14,12 +14,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 enum class WorkoutStatus { IDLE, LOADING, READY, RUNNING }
+
+/** Summary of a naturally finished workout, for the completion notification. */
+data class CompletedWorkoutInfo(
+    val sessionTitle: String,
+    val startedAtMillis: Long,
+    val endedAtMillis: Long
+)
 
 /**
  * Process-level singleton (owned by [PaceVikingApplication]). The timer lives
@@ -61,7 +70,18 @@ class WorkoutEngine(context: Context) {
     private val _completed = MutableStateFlow(false)
     val completed: StateFlow<Boolean> = _completed
 
+    // Fires once per advance into a new phase (index, phase); buffered so
+    // emitting from the timer never suspends even with no collector attached.
+    private val _phaseChanges = MutableSharedFlow<Pair<Int, WorkoutPhase>>(extraBufferCapacity = 8)
+    val phaseChanges: SharedFlow<Pair<Int, WorkoutPhase>> = _phaseChanges
+
+    // Fires once on natural completion, before the engine resets to IDLE.
+    private val _sessionCompletions = MutableSharedFlow<CompletedWorkoutInfo>(extraBufferCapacity = 1)
+    val sessionCompletions: SharedFlow<CompletedWorkoutInfo> = _sessionCompletions
+
     private var timerJob: Job? = null
+    private var sessionTitle: String = ""
+    private var startedAtMillis: Long = 0L
 
     /** Claims the engine for a new workout. False if one is already loading/running. */
     fun beginLoading(): Boolean {
@@ -75,11 +95,12 @@ class WorkoutEngine(context: Context) {
     }
 
     /** Loads the session and shows phase 1, but does not start the timer. */
-    fun load(phases: List<WorkoutPhase>) {
+    fun load(title: String, phases: List<WorkoutPhase>) {
         if (phases.isEmpty()) {
             abortLoading()
             return
         }
+        sessionTitle = title
         _completed.value = false
         _phases.value = phases
         _phaseIndex.value = 0
@@ -92,6 +113,7 @@ class WorkoutEngine(context: Context) {
     /** Starts the countdown of a READY workout. */
     fun begin() {
         if (_status.value != WorkoutStatus.READY) return
+        startedAtMillis = System.currentTimeMillis()
         _status.value = WorkoutStatus.RUNNING
         startTimer()
     }
@@ -156,10 +178,17 @@ class WorkoutEngine(context: Context) {
             val nextPhase = _phases.value[nextIndex]
             _currentPhase.value = nextPhase
             _timeLeftSeconds.value = nextPhase.durationSeconds
+            _phaseChanges.tryEmit(nextIndex to nextPhase)
             startTimer()
         } else {
-            reset()
+            // Emit the summary and latch completion BEFORE reset: observers
+            // reacting to the IDLE transition (WorkoutService) must already
+            // know this was a natural completion, not a manual stop.
+            _sessionCompletions.tryEmit(
+                CompletedWorkoutInfo(sessionTitle, startedAtMillis, System.currentTimeMillis())
+            )
             _completed.value = true
+            reset()
         }
     }
 
