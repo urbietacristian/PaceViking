@@ -10,15 +10,25 @@ import androidx.lifecycle.viewModelScope
 import com.example.paceviking.data.*
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
+/**
+ * [isBlock] is UI-only: blocks created with "Añadir bloque" keep their block
+ * frame even with one phase and one repetition; on reopening the editor it is
+ * re-derived from the persisted shape.
+ */
+data class EditorBlock(
+    val repetitions: Int,
+    val phases: List<WorkoutPhase>,
+    val isBlock: Boolean
+)
+
 data class EditorState(
     val session: WorkoutSession,
     val title: String,
-    val phases: List<WorkoutPhase>
+    val blocks: List<EditorBlock>
 )
 
 class WorkoutViewModel(application: Application) : AndroidViewModel(application) {
@@ -35,9 +45,9 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
 
     // Workout state is owned by the process-level WorkoutEngine; re-exposed for the UI.
     val workoutStatus: StateFlow<WorkoutStatus> = engine.status
-    val currentPhases: StateFlow<List<WorkoutPhase>> = engine.phases
+    val currentPhases: StateFlow<List<TimelinePhase>> = engine.phases
     val currentPhaseIndex: StateFlow<Int> = engine.phaseIndex
-    val currentPhase: StateFlow<WorkoutPhase?> = engine.currentPhase
+    val currentPhase: StateFlow<TimelinePhase?> = engine.currentPhase
     val timeLeftSeconds: StateFlow<Int> = engine.timeLeftSeconds
     val isPaused: StateFlow<Boolean> = engine.isPaused
 
@@ -66,11 +76,22 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // Session Management
-    fun saveSession(session: WorkoutSession, phases: List<WorkoutPhase>) {
+    fun saveSession(session: WorkoutSession, blocks: List<EditorBlock>) {
         viewModelScope.launch {
-            // Re-number orderIndex from list position: deletes/adds in the editor
-            // can leave duplicate indices, making the persisted order unstable.
-            dao.updateSessionWithPhases(session, phases.mapIndexed { i, p -> p.copy(orderIndex = i) })
+            // Re-number block and phase orderIndex from list position:
+            // deletes/adds in the editor can leave duplicate indices, making
+            // the persisted order unstable.
+            val ordered = blocks.mapIndexed { blockIdx, block ->
+                BlockWithPhases(
+                    block = WorkoutBlock(
+                        sessionId = session.id,
+                        repetitions = block.repetitions,
+                        orderIndex = blockIdx
+                    ),
+                    phases = block.phases.mapIndexed { phaseIdx, p -> p.copy(orderIndex = phaseIdx) }
+                )
+            }
+            dao.updateSessionWithBlocks(session, ordered)
         }
     }
 
@@ -81,26 +102,39 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun createDefaultSession() {
+        fun phase(type: PhaseType, seconds: Int, zone: HrZone) =
+            WorkoutPhase(blockId = 0, type = type, durationSeconds = seconds, targetHrZone = zone, orderIndex = 0)
+
         val defaultSession = WorkoutSession(title = "Protocolo Nórdico (4x4)")
-        val defaultPhases = listOf(
-            WorkoutPhase(sessionId = 0, type = PhaseType.WARM_UP, durationSeconds = 600, targetHrZone = HrZone.ZONE_2, orderIndex = 0),
-            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 1),
-            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 2),
-            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 3),
-            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 4),
-            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 5),
-            WorkoutPhase(sessionId = 0, type = PhaseType.RECOVERY, durationSeconds = 180, targetHrZone = HrZone.ZONE_2, orderIndex = 6),
-            WorkoutPhase(sessionId = 0, type = PhaseType.WORK, durationSeconds = 240, targetHrZone = HrZone.ZONE_4, orderIndex = 7),
-            WorkoutPhase(sessionId = 0, type = PhaseType.COOL_DOWN, durationSeconds = 300, targetHrZone = HrZone.ZONE_1, orderIndex = 8)
+        // 4 work intervals with 3 recoveries between them: a 3× block plus the
+        // final standalone work phase keeps the protocol exact.
+        val defaultBlocks = listOf(
+            EditorBlock(1, listOf(phase(PhaseType.WARM_UP, 600, HrZone.ZONE_2)), isBlock = false),
+            EditorBlock(
+                3,
+                listOf(
+                    phase(PhaseType.WORK, 240, HrZone.ZONE_4),
+                    phase(PhaseType.RECOVERY, 180, HrZone.ZONE_2)
+                ),
+                isBlock = true
+            ),
+            EditorBlock(1, listOf(phase(PhaseType.WORK, 240, HrZone.ZONE_4)), isBlock = false),
+            EditorBlock(1, listOf(phase(PhaseType.COOL_DOWN, 300, HrZone.ZONE_1)), isBlock = false)
         )
-        saveSession(defaultSession, defaultPhases)
+        saveSession(defaultSession, defaultBlocks)
     }
 
     // Editor
     fun openEditor(session: WorkoutSession) {
         viewModelScope.launch {
-            val phases = dao.getPhasesForSession(session.id).first()
-            _editorState.value = EditorState(session, session.title, phases)
+            val blocks = dao.getBlocksWithPhasesForSession(session.id).map { entry ->
+                EditorBlock(
+                    repetitions = entry.block.repetitions,
+                    phases = entry.phases.sortedBy { it.orderIndex },
+                    isBlock = entry.block.repetitions > 1 || entry.phases.size > 1
+                )
+            }
+            _editorState.value = EditorState(session, session.title, blocks)
         }
     }
 
@@ -113,39 +147,79 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         _editorState.value = _editorState.value?.copy(title = title)
     }
 
-    fun updateEditorPhase(index: Int, phase: WorkoutPhase) {
-        val editor = _editorState.value ?: return
-        _editorState.value = editor.copy(phases = editor.phases.mapIndexed { i, p -> if (i == index) phase else p })
-    }
-
-    fun removeEditorPhase(index: Int) {
-        val editor = _editorState.value ?: return
-        _editorState.value = editor.copy(phases = editor.phases.filterIndexed { i, _ -> i != index })
-    }
+    private fun newDefaultPhase() = WorkoutPhase(
+        blockId = 0,
+        type = PhaseType.WORK,
+        durationSeconds = 60,
+        targetHrZone = HrZone.NONE,
+        orderIndex = 0
+    )
 
     fun addEditorPhase() {
         val editor = _editorState.value ?: return
-        val newPhase = WorkoutPhase(
-            sessionId = editor.session.id,
-            type = PhaseType.WORK,
-            durationSeconds = 60,
-            targetHrZone = HrZone.NONE,
-            orderIndex = editor.phases.size
+        _editorState.value = editor.copy(
+            blocks = editor.blocks + EditorBlock(1, listOf(newDefaultPhase()), isBlock = false)
         )
-        _editorState.value = editor.copy(phases = editor.phases + newPhase)
+    }
+
+    fun addEditorBlock() {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(
+            blocks = editor.blocks + EditorBlock(2, listOf(newDefaultPhase()), isBlock = true)
+        )
+    }
+
+    fun updateBlockRepetitions(blockIndex: Int, repetitions: Int) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexed { i, block ->
+            if (i == blockIndex) block.copy(repetitions = repetitions.coerceIn(1, 99)) else block
+        })
+    }
+
+    fun removeEditorBlock(blockIndex: Int) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.filterIndexed { i, _ -> i != blockIndex })
+    }
+
+    fun addPhaseToBlock(blockIndex: Int) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexed { i, block ->
+            if (i == blockIndex) block.copy(phases = block.phases + newDefaultPhase()) else block
+        })
+    }
+
+    fun updateEditorPhase(blockIndex: Int, phaseIndex: Int, phase: WorkoutPhase) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexed { i, block ->
+            if (i != blockIndex) block
+            else block.copy(phases = block.phases.mapIndexed { j, p -> if (j == phaseIndex) phase else p })
+        })
+    }
+
+    fun removeEditorPhase(blockIndex: Int, phaseIndex: Int) {
+        val editor = _editorState.value ?: return
+        // Removing a block's last phase removes the block itself.
+        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexedNotNull { i, block ->
+            if (i != blockIndex) block
+            else {
+                val remaining = block.phases.filterIndexed { j, _ -> j != phaseIndex }
+                if (remaining.isEmpty()) null else block.copy(phases = remaining)
+            }
+        })
     }
 
     fun saveEditor() {
         val editor = _editorState.value ?: return
-        if (editor.phases.any { it.durationSeconds <= 0 }) {
+        val allPhases = editor.blocks.flatMap { it.phases }
+        if (allPhases.any { it.durationSeconds <= 0 }) {
             _userMessage.value = "Cada fase debe durar al menos 1 segundo."
             return
         }
-        if (editor.phases.any { (it.speedKmh ?: 0.0) !in 0.0..25.0 }) {
+        if (allPhases.any { (it.speedKmh ?: 0.0) !in 0.0..25.0 }) {
             _userMessage.value = "La velocidad debe estar entre 0.0 y 25.0 km/h."
             return
         }
-        saveSession(editor.session.copy(title = editor.title), editor.phases)
+        saveSession(editor.session.copy(title = editor.title), editor.blocks)
         _editorState.value = null
     }
 
@@ -159,13 +233,13 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     fun startWorkout(session: WorkoutSession) {
         if (!engine.beginLoading()) return
         viewModelScope.launch {
-            val phases = dao.getPhasesForSession(session.id).first()
-            if (phases.isEmpty()) {
+            val timeline = flattenToTimeline(dao.getBlocksWithPhasesForSession(session.id))
+            if (timeline.isEmpty()) {
                 engine.abortLoading()
                 _userMessage.value = "La sesión no tiene fases. Edítala y añade fases antes de empezar."
                 return@launch
             }
-            engine.load(session.title, phases)
+            engine.load(session.title, timeline)
         }
     }
 

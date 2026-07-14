@@ -1,8 +1,11 @@
 package com.example.paceviking.data
 
+import androidx.room.Embedded
 import androidx.room.Entity
 import androidx.room.ForeignKey
+import androidx.room.Index
 import androidx.room.PrimaryKey
+import androidx.room.Relation
 
 enum class PhaseType {
     WARM_UP, WORK, RECOVERY, COOL_DOWN
@@ -18,8 +21,12 @@ data class WorkoutSession(
     val title: String
 )
 
+/**
+ * A group of phases repeated [repetitions] times. A standalone phase is just a
+ * block with one phase and repetitions = 1 — the data layer has no special case.
+ */
 @Entity(
-    tableName = "phases",
+    tableName = "blocks",
     foreignKeys = [
         ForeignKey(
             entity = WorkoutSession::class,
@@ -27,11 +34,31 @@ data class WorkoutSession(
             childColumns = ["sessionId"],
             onDelete = ForeignKey.CASCADE
         )
-    ]
+    ],
+    indices = [Index("sessionId")]
+)
+data class WorkoutBlock(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val sessionId: Long,
+    val repetitions: Int,
+    val orderIndex: Int
+)
+
+@Entity(
+    tableName = "phases",
+    foreignKeys = [
+        ForeignKey(
+            entity = WorkoutBlock::class,
+            parentColumns = ["id"],
+            childColumns = ["blockId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [Index("blockId")]
 )
 data class WorkoutPhase(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val sessionId: Long,
+    val blockId: Long,
     val type: PhaseType,
     val durationSeconds: Int,
     val targetHrZone: HrZone,
@@ -40,7 +67,28 @@ data class WorkoutPhase(
     val speedKmh: Double? = null
 )
 
-data class SessionWithPhases(
-    val session: WorkoutSession,
+data class BlockWithPhases(
+    @Embedded val block: WorkoutBlock,
+    // @Relation does not guarantee order — sort by orderIndex before using.
+    @Relation(parentColumn = "id", entityColumn = "blockId")
     val phases: List<WorkoutPhase>
 )
+
+/**
+ * One entry of the expanded runtime timeline. Repetition is an editor/database
+ * concept: at runtime blocks are flattened so the engine, progress bar and
+ * notifications keep walking a plain list. [repetition] is 1-based.
+ */
+data class TimelinePhase(
+    val phase: WorkoutPhase,
+    val repetition: Int,
+    val totalRepetitions: Int
+)
+
+fun flattenToTimeline(blocks: List<BlockWithPhases>): List<TimelinePhase> =
+    blocks.sortedBy { it.block.orderIndex }.flatMap { entry ->
+        val ordered = entry.phases.sortedBy { it.orderIndex }
+        (1..entry.block.repetitions).flatMap { rep ->
+            ordered.map { TimelinePhase(it, rep, entry.block.repetitions) }
+        }
+    }

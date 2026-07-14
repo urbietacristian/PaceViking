@@ -14,7 +14,7 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.paceviking.data.HrZone
-import com.example.paceviking.data.WorkoutPhase
+import com.example.paceviking.data.TimelinePhase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -57,13 +57,14 @@ class WorkoutService : Service() {
                 combine(
                     engine.status, engine.currentPhase, engine.phaseIndex,
                     engine.timeLeftSeconds, engine.isPaused
-                ) { status, phase, index, timeLeft, paused ->
-                    if (status != WorkoutStatus.RUNNING || phase == null) {
+                ) { status, entry, index, timeLeft, paused ->
+                    if (status != WorkoutStatus.RUNNING || entry == null) {
                         null
                     } else {
                         val time = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60)
-                        val speed = phase.speedKmh?.let { String.format(Locale.US, " · %.1f km/h", it) } ?: ""
-                        val title = "${phase.type.name} — fase ${index + 1}/${engine.phases.value.size}"
+                        val speed = entry.phase.speedKmh?.let { String.format(Locale.US, " · %.1f km/h", it) } ?: ""
+                        val serie = if (entry.totalRepetitions > 1) " · serie ${entry.repetition}/${entry.totalRepetitions}" else ""
+                        val title = "${entry.phase.type.name} — fase ${index + 1}/${engine.phases.value.size}$serie"
                         title to if (paused) "$time$speed (en pausa)" else "$time$speed"
                     }
                 }.collect { content ->
@@ -79,9 +80,9 @@ class WorkoutService : Service() {
                 }
             }
             scope.launch {
-                engine.phaseChanges.collect { (index, phase) ->
+                engine.phaseChanges.collect { (index, entry) ->
                     if (!(application as PaceVikingApplication).isInForeground) {
-                        showPhaseChangeNotification(index, phase, engine.phases.value.size)
+                        showPhaseChangeNotification(index, entry, engine.phases.value.size)
                     }
                 }
             }
@@ -146,7 +147,8 @@ class WorkoutService : Service() {
      * and beeps on every transition, so the channel itself is silent — the
      * HIGH importance is what makes it pop over other apps.
      */
-    private fun showPhaseChangeNotification(index: Int, phase: WorkoutPhase, totalPhases: Int) {
+    private fun showPhaseChangeNotification(index: Int, entry: TimelinePhase, totalPhases: Int) {
+        val phase = entry.phase
         val duration = String.format(
             Locale.US, "%02d:%02d", phase.durationSeconds / 60, phase.durationSeconds % 60
         )
@@ -155,9 +157,10 @@ class WorkoutService : Service() {
             if (phase.targetHrZone != HrZone.NONE) add(phase.targetHrZone.name.replace("ZONE_", "Zona "))
             phase.speedKmh?.let { add(String.format(Locale.US, "%.1f km/h", it)) }
         }.joinToString(" · ")
+        val serie = if (entry.totalRepetitions > 1) " · Serie ${entry.repetition}/${entry.totalRepetitions}" else ""
 
         val notification = alertNotificationBuilder()
-            .setContentTitle("Nueva fase: ${phase.type.name} (${index + 1}/$totalPhases)")
+            .setContentTitle("Nueva fase: ${phase.type.name} (${index + 1}/$totalPhases)$serie")
             .setContentText(details)
             .build()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

@@ -13,6 +13,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -244,21 +245,43 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
 
             Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
 
-            editor.phases.forEachIndexed { index, phase ->
-                PhaseItem(
-                    phase = phase,
-                    onRemove = { viewModel.removeEditorPhase(index) },
-                    onUpdate = { updated -> viewModel.updateEditorPhase(index, updated) }
-                )
+            editor.blocks.forEachIndexed { blockIndex, block ->
+                if (!block.isBlock) {
+                    block.phases.firstOrNull()?.let { phase ->
+                        PhaseItem(
+                            phase = phase,
+                            onRemove = { viewModel.removeEditorPhase(blockIndex, 0) },
+                            onUpdate = { updated -> viewModel.updateEditorPhase(blockIndex, 0, updated) }
+                        )
+                    }
+                } else {
+                    BlockItem(
+                        block = block,
+                        onRepetitionsChange = { viewModel.updateBlockRepetitions(blockIndex, it) },
+                        onRemoveBlock = { viewModel.removeEditorBlock(blockIndex) },
+                        onAddPhase = { viewModel.addPhaseToBlock(blockIndex) },
+                        onUpdatePhase = { phaseIndex, updated ->
+                            viewModel.updateEditorPhase(blockIndex, phaseIndex, updated)
+                        },
+                        onRemovePhase = { phaseIndex -> viewModel.removeEditorPhase(blockIndex, phaseIndex) }
+                    )
+                }
             }
 
-            Button(
-                onClick = { viewModel.addEditorPhase() },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("Añadir Fase")
+                Button(onClick = { viewModel.addEditorPhase() }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Add, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Añadir Fase")
+                }
+                OutlinedButton(onClick = { viewModel.addEditorBlock() }, modifier = Modifier.weight(1f)) {
+                    Icon(Icons.Default.Add, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Añadir Bloque")
+                }
             }
         }
     }
@@ -355,6 +378,68 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
     }
 }
 
+/**
+ * Editor card for a repeatable block: a repetitions stepper in the header and
+ * the block's phases nested below, each edited with the regular [PhaseItem].
+ */
+@Composable
+fun BlockItem(
+    block: EditorBlock,
+    onRepetitionsChange: (Int) -> Unit,
+    onRemoveBlock: () -> Unit,
+    onAddPhase: () -> Unit,
+    onUpdatePhase: (Int, WorkoutPhase) -> Unit,
+    onRemovePhase: (Int) -> Unit
+) {
+    Card(
+        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth(),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Bloque",
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f)
+                )
+                IconButton(
+                    onClick = { onRepetitionsChange(block.repetitions - 1) },
+                    enabled = block.repetitions > 1
+                ) {
+                    Text("−", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(
+                    text = "× ${block.repetitions}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                IconButton(
+                    onClick = { onRepetitionsChange(block.repetitions + 1) },
+                    enabled = block.repetitions < 99
+                ) {
+                    Text("+", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                }
+                IconButton(onClick = onRemoveBlock) {
+                    Icon(Icons.Default.Delete, contentDescription = "Eliminar bloque", tint = Color.Gray)
+                }
+            }
+            block.phases.forEachIndexed { phaseIndex, phase ->
+                PhaseItem(
+                    phase = phase,
+                    onRemove = { onRemovePhase(phaseIndex) },
+                    onUpdate = { updated -> onUpdatePhase(phaseIndex, updated) }
+                )
+            }
+            TextButton(onClick = onAddPhase, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Añadir fase al bloque")
+            }
+        }
+    }
+}
+
 // Speed input allows up to 2 integer digits, one dot and one decimal (max 25.0).
 private fun filterSpeedInput(input: String): String {
     val cleaned = input.filter { it.isDigit() || it == '.' }
@@ -383,7 +468,8 @@ private fun phaseTypeColor(type: PhaseType): Color = when (type) {
 
 @Composable
 fun WorkoutScreen(viewModel: WorkoutViewModel) {
-    val phase by viewModel.currentPhase.collectAsStateWithLifecycle()
+    val currentEntry by viewModel.currentPhase.collectAsStateWithLifecycle()
+    val phase = currentEntry?.phase
     val timeLeft by viewModel.timeLeftSeconds.collectAsStateWithLifecycle()
     val isPaused by viewModel.isPaused.collectAsStateWithLifecycle()
     val currentIdx by viewModel.currentPhaseIndex.collectAsStateWithLifecycle()
@@ -441,7 +527,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         AlertDialog(
             onDismissRequest = dismissSkip,
             title = { Text("Saltar fase") },
-            text = { Text("¿Saltar a ${nextPhase?.type?.name}? El tiempo restante de la fase actual se descartará.") },
+            text = { Text("¿Saltar a ${nextPhase?.phase?.type?.name}? El tiempo restante de la fase actual se descartará.") },
             confirmButton = {
                 TextButton(onClick = {
                     showSkipDialog = false
@@ -485,11 +571,11 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val phaseColor = phase?.type?.let { phaseTypeColor(it) } ?: MaterialTheme.colorScheme.onBackground
 
     // Whole-session progress: elapsed time over total session time.
-    val totalSessionSeconds = remember(phases) { phases.sumOf { it.durationSeconds } }
+    val totalSessionSeconds = remember(phases) { phases.sumOf { it.phase.durationSeconds } }
     // Cumulative start second of each phase (size + 1: last entry is the total),
     // used to map overall progress onto each segment of the bar.
-    val phaseStartsSeconds = remember(phases) { phases.runningFold(0) { acc, p -> acc + p.durationSeconds } }
-    val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.durationSeconds } +
+    val phaseStartsSeconds = remember(phases) { phases.runningFold(0) { acc, p -> acc + p.phase.durationSeconds } }
+    val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.phase.durationSeconds } +
         ((phase?.durationSeconds ?: 0) - timeLeft)).coerceAtLeast(0)
     val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
     val animatedProgress by animateFloatAsState(targetValue = sessionProgress, label = "sessionProgress")
@@ -500,8 +586,10 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
+        val serieLabel = currentEntry?.takeIf { it.totalRepetitions > 1 }
+            ?.let { " · Serie ${it.repetition}/${it.totalRepetitions}" } ?: ""
         Text(
-            text = "Fase ${currentIdx + 1} / $totalPhases",
+            text = "Fase ${currentIdx + 1} / $totalPhases$serieLabel",
             style = MaterialTheme.typography.labelLarge,
             color = phaseColor.copy(alpha = 0.7f)
         )
@@ -554,26 +642,35 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         if (!isReady) {
             if (nextPhase != null) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // The speed goes on its own row so the SALTAR button never
-                    // gets squeezed by a long single-line summary.
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    // The phase type goes on its own line and every number
+                    // (duration, serie, speed) on the next; the column takes
+                    // exactly the width the button leaves over (weight), so
+                    // SALTAR always keeps its intrinsic size.
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.weight(1f)
+                    ) {
                         Text(
-                            text = "Siguiente: ${nextPhase.type.name} · " +
-                                String.format(Locale.US, "%02d:%02d", nextPhase.durationSeconds / 60, nextPhase.durationSeconds % 60),
+                            text = "Siguiente: ${nextPhase.phase.type.name}",
                             style = MaterialTheme.typography.titleMedium,
                             color = Color(0xFFBDBDBD)
                         )
-                        nextPhase.speedKmh?.let { speed ->
-                            Text(
-                                text = formatSpeedKmh(speed),
-                                style = MaterialTheme.typography.titleMedium,
-                                color = Color(0xFFBDBDBD)
-                            )
-                        }
+                        val nextDetails = buildList {
+                            add(formatMmSs(nextPhase.phase.durationSeconds))
+                            if (nextPhase.totalRepetitions > 1) {
+                                add("Serie ${nextPhase.repetition}/${nextPhase.totalRepetitions}")
+                            }
+                            nextPhase.phase.speedKmh?.let { add(formatSpeedKmh(it)) }
+                        }.joinToString(" · ")
+                        Text(
+                            text = nextDetails,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Color(0xFFBDBDBD)
+                        )
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                     TextButton(onClick = requestSkip) {
-                        Text("SALTAR", fontWeight = FontWeight.Bold, color = phaseColor)
+                        Text("SALTAR", fontWeight = FontWeight.Bold, color = phaseColor, maxLines = 1)
                     }
                 }
             } else {
@@ -635,7 +732,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                 horizontalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 phases.forEachIndexed { index, p ->
-                    val segmentColor = phaseTypeColor(p.type)
+                    val segmentColor = phaseTypeColor(p.phase.type)
                     val startFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index].toFloat() / totalSessionSeconds else 0f
                     val endFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index + 1].toFloat() / totalSessionSeconds else 0f
                     val fillFraction = if (endFraction > startFraction) {
@@ -643,7 +740,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                     } else 0f
                     Box(
                         modifier = Modifier
-                            .weight(p.durationSeconds.toFloat().coerceAtLeast(1f))
+                            .weight(p.phase.durationSeconds.toFloat().coerceAtLeast(1f))
                             .fillMaxHeight()
                             .clip(RoundedCornerShape(3.dp))
                             .background(segmentColor.copy(alpha = 0.25f))

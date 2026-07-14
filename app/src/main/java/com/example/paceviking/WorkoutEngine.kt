@@ -8,7 +8,7 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import com.example.paceviking.data.WorkoutPhase
+import com.example.paceviking.data.TimelinePhase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,14 +50,14 @@ class WorkoutEngine(context: Context) {
     private val _status = MutableStateFlow(WorkoutStatus.IDLE)
     val status: StateFlow<WorkoutStatus> = _status
 
-    private val _phases = MutableStateFlow<List<WorkoutPhase>>(emptyList())
-    val phases: StateFlow<List<WorkoutPhase>> = _phases
+    private val _phases = MutableStateFlow<List<TimelinePhase>>(emptyList())
+    val phases: StateFlow<List<TimelinePhase>> = _phases
 
     private val _phaseIndex = MutableStateFlow(-1)
     val phaseIndex: StateFlow<Int> = _phaseIndex
 
-    private val _currentPhase = MutableStateFlow<WorkoutPhase?>(null)
-    val currentPhase: StateFlow<WorkoutPhase?> = _currentPhase
+    private val _currentPhase = MutableStateFlow<TimelinePhase?>(null)
+    val currentPhase: StateFlow<TimelinePhase?> = _currentPhase
 
     private val _timeLeftSeconds = MutableStateFlow(0)
     val timeLeftSeconds: StateFlow<Int> = _timeLeftSeconds
@@ -72,8 +72,8 @@ class WorkoutEngine(context: Context) {
 
     // Fires once per advance into a new phase (index, phase); buffered so
     // emitting from the timer never suspends even with no collector attached.
-    private val _phaseChanges = MutableSharedFlow<Pair<Int, WorkoutPhase>>(extraBufferCapacity = 8)
-    val phaseChanges: SharedFlow<Pair<Int, WorkoutPhase>> = _phaseChanges
+    private val _phaseChanges = MutableSharedFlow<Pair<Int, TimelinePhase>>(extraBufferCapacity = 8)
+    val phaseChanges: SharedFlow<Pair<Int, TimelinePhase>> = _phaseChanges
 
     // Fires once on natural completion, before the engine resets to IDLE.
     private val _sessionCompletions = MutableSharedFlow<CompletedWorkoutInfo>(extraBufferCapacity = 1)
@@ -95,7 +95,7 @@ class WorkoutEngine(context: Context) {
     }
 
     /** Loads the session and shows phase 1, but does not start the timer. */
-    fun load(title: String, phases: List<WorkoutPhase>) {
+    fun load(title: String, phases: List<TimelinePhase>) {
         if (phases.isEmpty()) {
             abortLoading()
             return
@@ -105,7 +105,7 @@ class WorkoutEngine(context: Context) {
         _phases.value = phases
         _phaseIndex.value = 0
         _currentPhase.value = phases[0]
-        _timeLeftSeconds.value = phases[0].durationSeconds
+        _timeLeftSeconds.value = phases[0].phase.durationSeconds
         _isPaused.value = false
         _status.value = WorkoutStatus.READY
     }
@@ -177,7 +177,7 @@ class WorkoutEngine(context: Context) {
             _phaseIndex.value = nextIndex
             val nextPhase = _phases.value[nextIndex]
             _currentPhase.value = nextPhase
-            _timeLeftSeconds.value = nextPhase.durationSeconds
+            _timeLeftSeconds.value = nextPhase.phase.durationSeconds
             _phaseChanges.tryEmit(nextIndex to nextPhase)
             startTimer()
         } else {
