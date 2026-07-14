@@ -18,8 +18,14 @@ import kotlinx.coroutines.launch
  * [isBlock] is UI-only: blocks created with "Añadir bloque" keep their block
  * frame even with one phase and one repetition; on reopening the editor it is
  * re-derived from the persisted shape.
+ *
+ * [key] is a client-side stable identity for drag-to-reorder; it is not
+ * persisted (order comes from list position at save time). Phases reuse their
+ * [WorkoutPhase.id] as the reorder key — new phases get a unique negative temp
+ * id since the DAO re-zeroes ids on save.
  */
 data class EditorBlock(
+    val key: Long,
     val repetitions: Int,
     val phases: List<WorkoutPhase>,
     val isBlock: Boolean
@@ -59,6 +65,14 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     // One-shot message shown as a snackbar.
     private val _userMessage = mutableStateOf<String?>(null)
     val userMessage: State<String?> = _userMessage
+
+    // Monotonic sources of stable editor identities (main-thread only). Block
+    // keys are transient; phase temp ids are negative so they never collide
+    // with real (positive) DB ids and are discarded by the DAO on save.
+    private var nextBlockKeyValue = 0L
+    private fun nextBlockKey(): Long = nextBlockKeyValue++
+    private var nextTempPhaseIdValue = -1L
+    private fun nextTempPhaseId(): Long = nextTempPhaseIdValue--
 
     init {
         viewModelScope.launch {
@@ -109,8 +123,9 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         // 4 work intervals with 3 recoveries between them: a 3× block plus the
         // final standalone work phase keeps the protocol exact.
         val defaultBlocks = listOf(
-            EditorBlock(1, listOf(phase(PhaseType.WARM_UP, 600, HrZone.ZONE_2)), isBlock = false),
+            EditorBlock(nextBlockKey(), 1, listOf(phase(PhaseType.WARM_UP, 600, HrZone.ZONE_2)), isBlock = false),
             EditorBlock(
+                nextBlockKey(),
                 3,
                 listOf(
                     phase(PhaseType.WORK, 240, HrZone.ZONE_4),
@@ -118,8 +133,8 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
                 ),
                 isBlock = true
             ),
-            EditorBlock(1, listOf(phase(PhaseType.WORK, 240, HrZone.ZONE_4)), isBlock = false),
-            EditorBlock(1, listOf(phase(PhaseType.COOL_DOWN, 300, HrZone.ZONE_1)), isBlock = false)
+            EditorBlock(nextBlockKey(), 1, listOf(phase(PhaseType.WORK, 240, HrZone.ZONE_4)), isBlock = false),
+            EditorBlock(nextBlockKey(), 1, listOf(phase(PhaseType.COOL_DOWN, 300, HrZone.ZONE_1)), isBlock = false)
         )
         saveSession(defaultSession, defaultBlocks)
     }
@@ -129,6 +144,7 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val blocks = dao.getBlocksWithPhasesForSession(session.id).map { entry ->
                 EditorBlock(
+                    key = nextBlockKey(),
                     repetitions = entry.block.repetitions,
                     phases = entry.phases.sortedBy { it.orderIndex },
                     isBlock = entry.block.repetitions > 1 || entry.phases.size > 1
@@ -148,6 +164,7 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun newDefaultPhase() = WorkoutPhase(
+        id = nextTempPhaseId(),
         blockId = 0,
         type = PhaseType.WORK,
         durationSeconds = 60,
@@ -158,15 +175,37 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     fun addEditorPhase() {
         val editor = _editorState.value ?: return
         _editorState.value = editor.copy(
-            blocks = editor.blocks + EditorBlock(1, listOf(newDefaultPhase()), isBlock = false)
+            blocks = editor.blocks + EditorBlock(nextBlockKey(), 1, listOf(newDefaultPhase()), isBlock = false)
         )
     }
 
     fun addEditorBlock() {
         val editor = _editorState.value ?: return
         _editorState.value = editor.copy(
-            blocks = editor.blocks + EditorBlock(2, listOf(newDefaultPhase()), isBlock = true)
+            blocks = editor.blocks + EditorBlock(nextBlockKey(), 2, listOf(newDefaultPhase()), isBlock = true)
         )
+    }
+
+    /** Moves a top-level block/phase from one position to another (drag reorder). */
+    fun moveBlock(fromIndex: Int, toIndex: Int) {
+        val editor = _editorState.value ?: return
+        val blocks = editor.blocks
+        if (fromIndex !in blocks.indices || toIndex !in blocks.indices) return
+        _editorState.value = editor.copy(
+            blocks = blocks.toMutableList().apply { add(toIndex, removeAt(fromIndex)) }
+        )
+    }
+
+    /** Moves a phase within a block from one position to another (drag reorder). */
+    fun movePhaseInBlock(blockIndex: Int, fromIndex: Int, toIndex: Int) {
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexed { i, block ->
+            if (i != blockIndex) block
+            else {
+                if (fromIndex !in block.phases.indices || toIndex !in block.phases.indices) block
+                else block.copy(phases = block.phases.toMutableList().apply { add(toIndex, removeAt(fromIndex)) })
+            }
+        })
     }
 
     fun updateBlockRepetitions(blockIndex: Int, repetitions: Int) {

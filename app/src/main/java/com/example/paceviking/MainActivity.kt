@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,7 +35,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -45,6 +48,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.paceviking.data.*
 import com.example.paceviking.ui.theme.DangerRed
 import com.example.paceviking.ui.theme.PaceVikingTheme
+import sh.calvin.reorderable.ReorderableColumn
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -245,26 +249,49 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
 
             Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
 
-            editor.blocks.forEachIndexed { blockIndex, block ->
-                if (!block.isBlock) {
-                    block.phases.firstOrNull()?.let { phase ->
-                        PhaseItem(
-                            phase = phase,
-                            onRemove = { viewModel.removeEditorPhase(blockIndex, 0) },
-                            onUpdate = { updated -> viewModel.updateEditorPhase(blockIndex, 0, updated) }
+            val haptics = LocalHapticFeedback.current
+            ReorderableColumn(
+                list = editor.blocks,
+                onSettle = { from, to -> viewModel.moveBlock(from, to) },
+                onMove = { haptics.performHapticFeedback(HapticFeedbackType.SegmentTick) },
+                modifier = Modifier.fillMaxWidth()
+            ) { blockIndex, block, _ ->
+                key(block.key) {
+                    // draggableHandle() resolves against this ReorderableColumn's
+                    // scope; the handle reorders this item at the top level.
+                    val handle: @Composable () -> Unit = {
+                        IconButton(
+                            onClick = {},
+                            modifier = Modifier.draggableHandle(
+                                onDragStarted = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) }
+                            )
+                        ) {
+                            Icon(Icons.Default.DragHandle, contentDescription = "Reordenar", tint = Color.Gray)
+                        }
+                    }
+                    if (!block.isBlock) {
+                        block.phases.firstOrNull()?.let { phase ->
+                            PhaseItem(
+                                phase = phase,
+                                onRemove = { viewModel.removeEditorPhase(blockIndex, 0) },
+                                onUpdate = { updated -> viewModel.updateEditorPhase(blockIndex, 0, updated) },
+                                dragHandle = handle
+                            )
+                        }
+                    } else {
+                        BlockItem(
+                            block = block,
+                            dragHandle = handle,
+                            onRepetitionsChange = { viewModel.updateBlockRepetitions(blockIndex, it) },
+                            onRemoveBlock = { viewModel.removeEditorBlock(blockIndex) },
+                            onAddPhase = { viewModel.addPhaseToBlock(blockIndex) },
+                            onUpdatePhase = { phaseIndex, updated ->
+                                viewModel.updateEditorPhase(blockIndex, phaseIndex, updated)
+                            },
+                            onRemovePhase = { phaseIndex -> viewModel.removeEditorPhase(blockIndex, phaseIndex) },
+                            onMovePhase = { from, to -> viewModel.movePhaseInBlock(blockIndex, from, to) }
                         )
                     }
-                } else {
-                    BlockItem(
-                        block = block,
-                        onRepetitionsChange = { viewModel.updateBlockRepetitions(blockIndex, it) },
-                        onRemoveBlock = { viewModel.removeEditorBlock(blockIndex) },
-                        onAddPhase = { viewModel.addPhaseToBlock(blockIndex) },
-                        onUpdatePhase = { phaseIndex, updated ->
-                            viewModel.updateEditorPhase(blockIndex, phaseIndex, updated)
-                        },
-                        onRemovePhase = { phaseIndex -> viewModel.removeEditorPhase(blockIndex, phaseIndex) }
-                    )
                 }
             }
 
@@ -288,7 +315,12 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
 }
 
 @Composable
-fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase) -> Unit) {
+fun PhaseItem(
+    phase: WorkoutPhase,
+    onRemove: () -> Unit,
+    onUpdate: (WorkoutPhase) -> Unit,
+    dragHandle: (@Composable () -> Unit)? = null
+) {
     val minutes = phase.durationSeconds / 60
     val seconds = phase.durationSeconds % 60
     // Raw text as local state so the fields can be emptied while typing; keyed
@@ -306,6 +338,7 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
     Card(modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                dragHandle?.invoke()
                 // Phase Type Toggle
                 Text(
                     text = phase.type.name,
@@ -385,11 +418,13 @@ fun PhaseItem(phase: WorkoutPhase, onRemove: () -> Unit, onUpdate: (WorkoutPhase
 @Composable
 fun BlockItem(
     block: EditorBlock,
+    dragHandle: @Composable () -> Unit,
     onRepetitionsChange: (Int) -> Unit,
     onRemoveBlock: () -> Unit,
     onAddPhase: () -> Unit,
     onUpdatePhase: (Int, WorkoutPhase) -> Unit,
-    onRemovePhase: (Int) -> Unit
+    onRemovePhase: (Int) -> Unit,
+    onMovePhase: (Int, Int) -> Unit
 ) {
     Card(
         modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth(),
@@ -397,6 +432,7 @@ fun BlockItem(
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                dragHandle()
                 Text(
                     text = "Bloque",
                     fontWeight = FontWeight.Bold,
@@ -424,12 +460,31 @@ fun BlockItem(
                     Icon(Icons.Default.Delete, contentDescription = "Eliminar bloque", tint = Color.Gray)
                 }
             }
-            block.phases.forEachIndexed { phaseIndex, phase ->
-                PhaseItem(
-                    phase = phase,
-                    onRemove = { onRemovePhase(phaseIndex) },
-                    onUpdate = { updated -> onUpdatePhase(phaseIndex, updated) }
-                )
+            // Nested reorder scope: each phase's handle moves it within this block.
+            val haptics = LocalHapticFeedback.current
+            ReorderableColumn(
+                list = block.phases,
+                onSettle = { from, to -> onMovePhase(from, to) },
+                onMove = { haptics.performHapticFeedback(HapticFeedbackType.SegmentTick) },
+                modifier = Modifier.fillMaxWidth()
+            ) { phaseIndex, phase, _ ->
+                key(phase.id) {
+                    PhaseItem(
+                        phase = phase,
+                        onRemove = { onRemovePhase(phaseIndex) },
+                        onUpdate = { updated -> onUpdatePhase(phaseIndex, updated) },
+                        dragHandle = {
+                            IconButton(
+                                onClick = {},
+                                modifier = Modifier.draggableHandle(
+                                    onDragStarted = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) }
+                                )
+                            ) {
+                                Icon(Icons.Default.DragHandle, contentDescription = "Reordenar fase", tint = Color.Gray)
+                            }
+                        }
+                    )
+                }
             }
             TextButton(onClick = onAddPhase, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Default.Add, contentDescription = null)
