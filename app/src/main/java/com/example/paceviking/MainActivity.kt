@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -30,6 +31,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -367,6 +369,18 @@ private fun formatSpeedForEditor(speed: Double): String =
 
 private fun formatSpeedKmh(speed: Double): String = String.format(Locale.US, "%.1f km/h", speed)
 
+private fun formatMmSs(totalSeconds: Int): String =
+    String.format(Locale.US, "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+
+// Bright accent per phase type, shared by the current-phase texts and the
+// segmented session progress bar.
+private fun phaseTypeColor(type: PhaseType): Color = when (type) {
+    PhaseType.WORK -> Color(0xFFFF8A80)
+    PhaseType.RECOVERY -> Color(0xFF81C784)
+    PhaseType.WARM_UP -> Color(0xFF64B5F6)
+    PhaseType.COOL_DOWN -> Color(0xFFCE93D8)
+}
+
 @Composable
 fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val phase by viewModel.currentPhase.collectAsStateWithLifecycle()
@@ -468,16 +482,13 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         else -> MaterialTheme.colorScheme.background
     }
 
-    val phaseColor = when (phase?.type) {
-        PhaseType.WORK -> Color(0xFFFF8A80)
-        PhaseType.RECOVERY -> Color(0xFF81C784)
-        PhaseType.WARM_UP -> Color(0xFF64B5F6)
-        PhaseType.COOL_DOWN -> Color(0xFFCE93D8)
-        else -> MaterialTheme.colorScheme.onBackground
-    }
+    val phaseColor = phase?.type?.let { phaseTypeColor(it) } ?: MaterialTheme.colorScheme.onBackground
 
     // Whole-session progress: elapsed time over total session time.
     val totalSessionSeconds = remember(phases) { phases.sumOf { it.durationSeconds } }
+    // Cumulative start second of each phase (size + 1: last entry is the total),
+    // used to map overall progress onto each segment of the bar.
+    val phaseStartsSeconds = remember(phases) { phases.runningFold(0) { acc, p -> acc + p.durationSeconds } }
     val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.durationSeconds } +
         ((phase?.durationSeconds ?: 0) - timeLeft)).coerceAtLeast(0)
     val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
@@ -611,14 +622,58 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         }
         }
 
-        LinearProgressIndicator(
-            progress = { animatedProgress },
+        // Session overview: one segment per phase, width proportional to its
+        // duration, filled left-to-right as the whole session advances.
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .padding(horizontal = 24.dp, vertical = 8.dp),
-            color = phaseColor,
-            trackColor = phaseColor.copy(alpha = 0.2f)
-        )
+                .padding(horizontal = 24.dp, vertical = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().height(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                phases.forEachIndexed { index, p ->
+                    val segmentColor = phaseTypeColor(p.type)
+                    val startFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index].toFloat() / totalSessionSeconds else 0f
+                    val endFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index + 1].toFloat() / totalSessionSeconds else 0f
+                    val fillFraction = if (endFraction > startFraction) {
+                        ((animatedProgress - startFraction) / (endFraction - startFraction)).coerceIn(0f, 1f)
+                    } else 0f
+                    Box(
+                        modifier = Modifier
+                            .weight(p.durationSeconds.toFloat().coerceAtLeast(1f))
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(segmentColor.copy(alpha = 0.25f))
+                    ) {
+                        if (fillFraction > 0f) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .fillMaxWidth(fillFraction)
+                                    .background(segmentColor)
+                            )
+                        }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "${formatMmSs(elapsedSeconds)} / ${formatMmSs(totalSessionSeconds)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color(0xFF9E9E9E)
+                )
+                Text(
+                    text = "faltan ${formatMmSs((totalSessionSeconds - elapsedSeconds).coerceAtLeast(0))}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color(0xFF9E9E9E)
+                )
+            }
+        }
     }
 }
