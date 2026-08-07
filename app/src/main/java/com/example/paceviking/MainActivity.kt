@@ -7,7 +7,10 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -34,6 +37,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -633,7 +638,29 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.phase.durationSeconds } +
         ((phase?.durationSeconds ?: 0) - timeLeft)).coerceAtLeast(0)
     val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
-    val animatedProgress by animateFloatAsState(targetValue = sessionProgress, label = "sessionProgress")
+    // Same one-tick linear tween as the phase fill, so both bars advance
+    // continuously instead of stepping once per second.
+    val animatedProgress by animateFloatAsState(
+        targetValue = sessionProgress,
+        animationSpec = if (sessionProgress == 0f) snap() else tween(1000, easing = LinearEasing),
+        label = "sessionProgress"
+    )
+
+    // Current phase progress, drawn as the clock's own background: the tinted
+    // fill starts empty and grows to the right as the phase advances.
+    val phaseDuration = phase?.durationSeconds ?: 0
+    val phaseProgress = if (phaseDuration > 0) {
+        ((phaseDuration - timeLeft).toFloat() / phaseDuration).coerceIn(0f, 1f)
+    } else 0f
+    // The engine ticks once per second, so the raw value moves in steps. A
+    // linear tween exactly one tick long turns those steps into a continuous
+    // slide; a new phase (progress back to 0) snaps instead of rewinding.
+    val animatedPhaseProgress by animateFloatAsState(
+        targetValue = phaseProgress,
+        animationSpec = if (phaseProgress == 0f) snap() else tween(1000, easing = LinearEasing),
+        label = "phaseProgress"
+    )
+    val fillColor = phaseColor.copy(alpha = 0.30f)
 
     Box(modifier = Modifier.fillMaxSize().background(backgroundColor).systemBarsPadding()) {
         Column(
@@ -685,12 +712,34 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
         Spacer(modifier = Modifier.height(64.dp))
 
-        Text(
-            text = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60),
-            style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
-            fontWeight = FontWeight.Thin,
-            color = Color(0xFFF5F5F5)
-        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(20.dp))
+                .background(phaseColor.copy(alpha = 0.10f))
+        ) {
+            // Drawn instead of sized: the clock's height comes from the text,
+            // so the fill has to match the parent and paint a fraction of it.
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .drawBehind {
+                        drawRect(
+                            color = fillColor,
+                            size = Size(size.width * animatedPhaseProgress, size.height)
+                        )
+                    }
+            )
+            Text(
+                text = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60),
+                style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
+                fontWeight = FontWeight.Thin,
+                color = Color(0xFFF5F5F5),
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(vertical = 8.dp)
+            )
+        }
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -790,25 +839,28 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                     val segmentColor = phaseTypeColor(p.phase.type)
                     val startFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index].toFloat() / totalSessionSeconds else 0f
                     val endFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index + 1].toFloat() / totalSessionSeconds else 0f
-                    val fillFraction = if (endFraction > startFraction) {
-                        ((animatedProgress - startFraction) / (endFraction - startFraction)).coerceIn(0f, 1f)
-                    } else 0f
+                    // The fill is drawn rather than laid out: reading the
+                    // animation inside drawBehind keeps the per-frame work to
+                    // the draw phase, with no recomposition or re-layout.
                     Box(
                         modifier = Modifier
                             .weight(p.phase.durationSeconds.toFloat().coerceAtLeast(1f))
                             .fillMaxHeight()
                             .clip(RoundedCornerShape(3.dp))
                             .background(segmentColor.copy(alpha = 0.25f))
-                    ) {
-                        if (fillFraction > 0f) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .fillMaxWidth(fillFraction)
-                                    .background(segmentColor)
-                            )
-                        }
-                    }
+                            .drawBehind {
+                                val fillFraction = if (endFraction > startFraction) {
+                                    ((animatedProgress - startFraction) / (endFraction - startFraction))
+                                        .coerceIn(0f, 1f)
+                                } else 0f
+                                if (fillFraction > 0f) {
+                                    drawRect(
+                                        color = segmentColor,
+                                        size = Size(size.width * fillFraction, size.height)
+                                    )
+                                }
+                            }
+                    )
                 }
             }
             Row(
