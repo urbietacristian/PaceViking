@@ -252,7 +252,32 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                 modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
             )
 
-            Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
+            // Cumulative start offset of each block on the session timeline, so
+            // every phase can show when it begins and ends. A block's span
+            // counts all its repetitions.
+            val blockStarts = remember(editor.blocks) {
+                var elapsed = 0
+                editor.blocks.map { block ->
+                    val start = elapsed
+                    elapsed += block.phases.sumOf { it.durationSeconds } * block.repetitions
+                    start
+                }
+            }
+            val totalSeconds = remember(editor.blocks) {
+                editor.blocks.sumOf { block -> block.phases.sumOf { it.durationSeconds } * block.repetitions }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                Text(
+                    text = "Total ${formatClock(totalSeconds)}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
 
             val haptics = LocalHapticFeedback.current
             ReorderableColumn(
@@ -274,10 +299,12 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                             Icon(Icons.Default.DragHandle, contentDescription = "Reordenar", tint = Color.Gray)
                         }
                     }
+                    val blockStart = blockStarts.getOrElse(blockIndex) { 0 }
                     if (!block.isBlock) {
                         block.phases.firstOrNull()?.let { phase ->
                             PhaseItem(
                                 phase = phase,
+                                timeRange = rangeLabel(blockStart, phase.durationSeconds),
                                 onRemove = { viewModel.removeEditorPhase(blockIndex, 0) },
                                 onUpdate = { updated -> viewModel.updateEditorPhase(blockIndex, 0, updated) },
                                 dragHandle = handle
@@ -286,6 +313,7 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                     } else {
                         BlockItem(
                             block = block,
+                            startSeconds = blockStart,
                             dragHandle = handle,
                             onRepetitionsChange = { viewModel.updateBlockRepetitions(blockIndex, it) },
                             onRemoveBlock = { viewModel.removeEditorBlock(blockIndex) },
@@ -322,6 +350,8 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
 @Composable
 fun PhaseItem(
     phase: WorkoutPhase,
+    // "mm:ss → mm:ss": when this phase starts and ends on the session timeline.
+    timeRange: String,
     onRemove: () -> Unit,
     onUpdate: (WorkoutPhase) -> Unit,
     dragHandle: (@Composable () -> Unit)? = null
@@ -353,6 +383,11 @@ fun PhaseItem(
                     },
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = timeRange,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.Gray
                 )
                 IconButton(onClick = onRemove) {
                     Icon(Icons.Default.Delete, contentDescription = "Eliminar fase", tint = Color.Gray)
@@ -423,6 +458,8 @@ fun PhaseItem(
 @Composable
 fun BlockItem(
     block: EditorBlock,
+    // Offset of the block's first repetition on the session timeline.
+    startSeconds: Int,
     dragHandle: @Composable () -> Unit,
     onRepetitionsChange: (Int) -> Unit,
     onRemoveBlock: () -> Unit,
@@ -435,15 +472,22 @@ fun BlockItem(
         modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth(),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
     ) {
+        val roundSeconds = block.phases.sumOf { it.durationSeconds }
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 dragHandle()
-                Text(
-                    text = "Bloque",
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Bloque",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = rangeLabel(startSeconds, roundSeconds * block.repetitions),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = Color.Gray
+                    )
+                }
                 IconButton(
                     onClick = { onRepetitionsChange(block.repetitions - 1) },
                     enabled = block.repetitions > 1
@@ -465,6 +509,20 @@ fun BlockItem(
                     Icon(Icons.Default.Delete, contentDescription = "Eliminar bloque", tint = Color.Gray)
                 }
             }
+            if (block.repetitions > 1) {
+                Text(
+                    text = "Horarios de la 1ª repetición (+${formatClock(roundSeconds)} por repetición)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.Gray
+                )
+            }
+            // Start offsets of this block's phases inside its first repetition.
+            var phaseElapsed = startSeconds
+            val phaseStarts = block.phases.map { phase ->
+                val start = phaseElapsed
+                phaseElapsed += phase.durationSeconds
+                start
+            }
             // Nested reorder scope: each phase's handle moves it within this block.
             val haptics = LocalHapticFeedback.current
             ReorderableColumn(
@@ -476,6 +534,10 @@ fun BlockItem(
                 key(phase.id) {
                     PhaseItem(
                         phase = phase,
+                        timeRange = rangeLabel(
+                            phaseStarts.getOrElse(phaseIndex) { startSeconds },
+                            phase.durationSeconds
+                        ),
                         onRemove = { onRemovePhase(phaseIndex) },
                         onUpdate = { updated -> onUpdatePhase(phaseIndex, updated) },
                         dragHandle = {
@@ -513,6 +575,18 @@ private fun formatSpeedForEditor(speed: Double): String =
     if (speed % 1.0 == 0.0) speed.toInt().toString() else String.format(Locale.US, "%.1f", speed)
 
 private fun formatSpeedKmh(speed: Double): String = String.format(Locale.US, "%.1f km/h", speed)
+
+// Timeline positions in the editor: mm:ss, growing to h:mm:ss past an hour.
+private fun formatClock(totalSeconds: Int): String {
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val seconds = totalSeconds % 60
+    return if (hours > 0) String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
+    else String.format(Locale.US, "%02d:%02d", minutes, seconds)
+}
+
+private fun rangeLabel(startSeconds: Int, durationSeconds: Int): String =
+    "${formatClock(startSeconds)} → ${formatClock(startSeconds + durationSeconds)}"
 
 private fun formatMmSs(totalSeconds: Int): String =
     String.format(Locale.US, "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
