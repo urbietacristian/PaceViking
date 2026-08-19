@@ -2,6 +2,7 @@ package com.example.paceviking
 
 import android.app.Application
 import android.content.Intent
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
@@ -24,6 +25,7 @@ import kotlinx.coroutines.launch
  * [WorkoutPhase.id] as the reorder key — new phases get a unique negative temp
  * id since the DAO re-zeroes ids on save.
  */
+@Immutable
 data class EditorBlock(
     val key: Long,
     val repetitions: Int,
@@ -31,6 +33,7 @@ data class EditorBlock(
     val isBlock: Boolean
 )
 
+@Immutable
 data class EditorState(
     val session: WorkoutSession,
     val title: String,

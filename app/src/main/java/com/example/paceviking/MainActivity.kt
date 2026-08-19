@@ -22,12 +22,13 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -45,7 +46,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.layout
@@ -67,6 +67,8 @@ import com.example.paceviking.ui.theme.PaceVikingTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableColumn
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -224,7 +226,7 @@ fun SessionListScreen(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SessionEditorScreen(viewModel: WorkoutViewModel) {
     val editor = viewModel.editorState.value ?: return
@@ -258,10 +260,9 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
             )
         }
     ) { padding ->
-        val scrollState = rememberScrollState()
+        val listState = rememberLazyListState()
         val scope = rememberCoroutineScope()
-        // Bounds of the scroll viewport (captured before verticalScroll, so the
-        // size is the visible one) — needed to centre a duplicated phase.
+        // Bounds of the list viewport — needed to centre a duplicated phase.
         var viewportCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
         val scrollTargetId = viewModel.pendingScrollPhaseId.value
         val highlightId = viewModel.highlightPhaseId.value
@@ -289,67 +290,125 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
             }
         }
 
+        // Scrolls the list so the given card sits as close to the middle of the
+        // viewport as the list's own bounds allow.
         val centerOnPhase: (LayoutCoordinates) -> Unit = { coords ->
             val viewport = viewportCoords
             if (viewport != null && viewport.isAttached && coords.isAttached) {
                 val relativeY = viewport.localPositionOf(coords, Offset.Zero).y
-                val centred = scrollState.value + relativeY - (viewport.size.height - coords.size.height) / 2f
-                val target = centred.roundToInt().coerceIn(0, scrollState.maxValue)
-                scope.launch { scrollState.animateScrollTo(target) }
+                val delta = relativeY - (viewport.size.height - coords.size.height) / 2f
+                scope.launch { listState.animateScrollBy(delta) }
             }
             viewModel.clearPendingScroll()
         }
 
-        Column(
-            modifier = Modifier
-                .padding(padding)
-                .padding(16.dp)
-                .onGloballyPositioned { viewportCoords = it }
-                .verticalScroll(scrollState)
-        ) {
-            OutlinedTextField(
-                value = editor.title,
-                onValueChange = { viewModel.updateEditorTitle(it) },
-                label = { Text("Título de la Sesión") },
-                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
-            )
+        // Cumulative start offset of each block on the session timeline, so
+        // every phase can show when it begins and ends. A block's span counts
+        // all its repetitions.
+        val blockStarts = remember(editor.blocks) {
+            var elapsed = 0
+            editor.blocks.map { block ->
+                val start = elapsed
+                elapsed += block.phases.sumOf { it.durationSeconds } * block.repetitions
+                start
+            }
+        }
+        val totalSeconds = remember(editor.blocks) {
+            editor.blocks.sumOf { block -> block.phases.sumOf { it.durationSeconds } * block.repetitions }
+        }
 
-            // Cumulative start offset of each block on the session timeline, so
-            // every phase can show when it begins and ends. A block's span
-            // counts all its repetitions.
-            val blockStarts = remember(editor.blocks) {
-                var elapsed = 0
-                editor.blocks.map { block ->
-                    val start = elapsed
-                    elapsed += block.phases.sumOf { it.durationSeconds } * block.repetitions
-                    start
+        // A phase created off-screen is not composed, so it can never report its
+        // position: bring its block into view first and let centerOnPhase
+        // fine-tune the centring once it exists.
+        LaunchedEffect(scrollTargetId) {
+            if (scrollTargetId != null) {
+                val blockIndex = editor.blocks.indexOfFirst { b -> b.phases.any { it.id == scrollTargetId } }
+                val key = editor.blocks.getOrNull(blockIndex)?.key
+                if (key != null && listState.layoutInfo.visibleItemsInfo.none { it.key == key }) {
+                    listState.scrollToItem(blockIndex + EDITOR_HEADER_ITEMS)
                 }
             }
-            val totalSeconds = remember(editor.blocks) {
-                editor.blocks.sumOf { block -> block.phases.sumOf { it.durationSeconds } * block.repetitions }
-            }
+        }
 
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                Text(
-                    text = "Total ${formatClock(totalSeconds)}",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary
+        // With edge-to-edge the window doesn't resize for the keyboard, so the
+        // list is padded by the IME inset instead: that shrinks its viewport and
+        // lets Compose's built-in bring-into-view lift the focused field above
+        // the keyboard. The extra bottom padding gives the *last* card room to
+        // be scrolled up — without it there is nothing below to scroll into.
+        val imeVisible = WindowInsets.isImeVisible
+        var savedIndex by remember { mutableIntStateOf(0) }
+        var savedOffset by remember { mutableIntStateOf(0) }
+        var keyboardWasOpen by remember { mutableStateOf(false) }
+        // While the keyboard is closed the current position is tracked, so what
+        // gets restored is exactly where the list stood before it opened.
+        LaunchedEffect(imeVisible, listState) {
+            if (!imeVisible) {
+                snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                    .collect { (index, offset) ->
+                        savedIndex = index
+                        savedOffset = offset
+                    }
+            }
+        }
+        LaunchedEffect(imeVisible) {
+            if (imeVisible) keyboardWasOpen = true
+            else if (keyboardWasOpen) {
+                keyboardWasOpen = false
+                listState.animateScrollToItem(savedIndex, savedOffset)
+            }
+        }
+
+        val haptics = LocalHapticFeedback.current
+        val reorderState = rememberReorderableLazyListState(listState) { from, to ->
+            // Item indices include the header items above the block list.
+            viewModel.moveBlock(from.index - EDITOR_HEADER_ITEMS, to.index - EDITOR_HEADER_ITEMS)
+            haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .padding(padding)
+                // Scaffold's padding already covers the navigation bar; consuming
+                // it keeps imePadding from stacking that inset a second time.
+                .consumeWindowInsets(padding)
+                .padding(horizontal = 16.dp)
+                .imePadding()
+                .onGloballyPositioned { viewportCoords = it },
+            contentPadding = PaddingValues(
+                top = 16.dp,
+                bottom = if (imeVisible) 16.dp + KEYBOARD_SCROLL_HEADROOM else 16.dp
+            )
+        ) {
+            item(key = EDITOR_KEY_TITLE, contentType = "header") {
+                OutlinedTextField(
+                    value = editor.title,
+                    onValueChange = { viewModel.updateEditorTitle(it) },
+                    label = { Text("Título de la Sesión") },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
                 )
             }
+            item(key = EDITOR_KEY_SUBHEADER, contentType = "header") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Fases", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    Text(
+                        text = "Total ${formatClock(totalSeconds)}",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
 
-            val haptics = LocalHapticFeedback.current
-            ReorderableColumn(
-                list = editor.blocks,
-                onSettle = { from, to -> viewModel.moveBlock(from, to) },
-                onMove = { haptics.performHapticFeedback(HapticFeedbackType.SegmentTick) },
-                modifier = Modifier.fillMaxWidth()
-            ) { blockIndex, block, _ ->
-                key(block.key) {
-                    // draggableHandle() resolves against this ReorderableColumn's
+            itemsIndexed(
+                items = editor.blocks,
+                key = { _, block -> block.key },
+                contentType = { _, block -> if (block.isBlock) "block" else "phase" }
+            ) { blockIndex, block ->
+                ReorderableItem(reorderState, key = block.key) { _ ->
+                    // draggableHandle() resolves against this ReorderableItem's
                     // scope; the handle reorders this item at the top level.
                     val handle: @Composable () -> Unit = {
                         IconButton(
@@ -400,24 +459,37 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(onClick = { viewModel.addEditorPhase() }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Add, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Añadir Fase")
-                }
-                OutlinedButton(onClick = { viewModel.addEditorBlock() }, modifier = Modifier.weight(1f)) {
-                    Icon(Icons.Default.Add, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Añadir Bloque")
+            item(key = EDITOR_KEY_ACTIONS, contentType = "footer") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(onClick = { viewModel.addEditorPhase() }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Añadir Fase")
+                    }
+                    OutlinedButton(onClick = { viewModel.addEditorBlock() }, modifier = Modifier.weight(1f)) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Añadir Bloque")
+                    }
                 }
             }
         }
     }
 }
+
+// The editor list starts with the title field and the "Fases" header, so lazy
+// item indices are two ahead of the block indices the ViewModel works with.
+private const val EDITOR_HEADER_ITEMS = 2
+
+// Room added below the last card while the keyboard is open, so even the final
+// phase can be scrolled up clear of it.
+private val KEYBOARD_SCROLL_HEADROOM = 260.dp
+private const val EDITOR_KEY_TITLE = "editor-title"
+private const val EDITOR_KEY_SUBHEADER = "editor-subheader"
+private const val EDITOR_KEY_ACTIONS = "editor-actions"
 
 @Composable
 fun PhaseItem(
@@ -454,10 +526,9 @@ fun PhaseItem(
             .padding(vertical = 4.dp)
             .fillMaxWidth()
             .then(onPlaced?.let { Modifier.onGloballyPositioned(it) } ?: Modifier)
-            .deleteExit(isDeleting),
-        colors = CardDefaults.cardColors(containerColor = editorCardColor(isNew, isDeleting))
+            .deleteExit(isDeleting)
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(modifier = Modifier.editorFlash(isNew, isDeleting).padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 dragHandle?.invoke()
                 // Phase Type Toggle
@@ -581,11 +652,10 @@ fun BlockItem(
             .padding(vertical = 4.dp)
             .fillMaxWidth()
             .deleteExit(isDeleting),
-        colors = CardDefaults.cardColors(containerColor = editorCardColor(isNew, isDeleting)),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
     ) {
         val roundSeconds = block.phases.sumOf { it.durationSeconds }
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(modifier = Modifier.editorFlash(isNew, isDeleting).padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 dragHandle()
                 Column(modifier = Modifier.weight(1f)) {
@@ -721,16 +791,18 @@ private fun Modifier.deleteExit(isDeleting: Boolean): Modifier {
         if (isDeleting) progress.animateTo(1f, tween(DELETE_EXIT_MS.toInt(), easing = FastOutLinearInEasing))
         else progress.snapTo(0f)
     }
-    if (progress.value == 0f) return this
-    val slide = (progress.value / DELETE_SLIDE_FRACTION).coerceAtMost(1f)
-    val collapse =
-        ((progress.value - DELETE_COLLAPSE_START) / (1f - DELETE_COLLAPSE_START)).coerceIn(0f, 1f)
+    // The animation value is only read inside the graphicsLayer/layout lambdas,
+    // so each frame invalidates draw and layout but never recomposition — a
+    // card full of text fields would be far too heavy to rebuild per frame.
     return this
         .graphicsLayer {
+            val slide = (progress.value / DELETE_SLIDE_FRACTION).coerceAtMost(1f)
             translationX = size.width * slide
             alpha = 1f - slide
         }
         .layout { measurable, constraints ->
+            val collapse = ((progress.value - DELETE_COLLAPSE_START) / (1f - DELETE_COLLAPSE_START))
+                .coerceIn(0f, 1f)
             val placeable = measurable.measure(constraints)
             layout(placeable.width, (placeable.height * (1f - collapse)).roundToInt()) {
                 placeable.place(0, 0)
@@ -739,12 +811,12 @@ private fun Modifier.deleteExit(isDeleting: Boolean): Modifier {
 }
 
 /**
- * Card background for an editor card: tinted green right after creation (fading
- * back to the default) and washed red while it is being deleted.
+ * Creation/deletion tint, painted behind the card's content. Like [deleteExit]
+ * the animation values are read in the draw lambda only, so the flash costs a
+ * redraw per frame instead of a recomposition.
  */
 @Composable
-private fun editorCardColor(isNew: Boolean, isDeleting: Boolean): Color {
-    val base = CardDefaults.cardColors().containerColor
+private fun Modifier.editorFlash(isNew: Boolean, isDeleting: Boolean): Modifier {
     val createFlash = remember { Animatable(0f) }
     LaunchedEffect(isNew) {
         if (isNew) {
@@ -752,12 +824,17 @@ private fun editorCardColor(isNew: Boolean, isDeleting: Boolean): Color {
             createFlash.animateTo(0f, tween(CREATE_FLASH_MS.toInt(), easing = LinearEasing))
         }
     }
-    val deleteTint by animateFloatAsState(
-        targetValue = if (isDeleting) 1f else 0f,
-        animationSpec = tween(DELETE_TINT_MS),
-        label = "deleteTint"
-    )
-    return lerp(lerp(base, CreateFlash, createFlash.value * 0.8f), DeleteFlash, deleteTint)
+    val deleteTint = remember { Animatable(0f) }
+    LaunchedEffect(isDeleting) {
+        if (isDeleting) deleteTint.animateTo(1f, tween(DELETE_TINT_MS))
+        else deleteTint.snapTo(0f)
+    }
+    return drawBehind {
+        val create = createFlash.value
+        if (create > 0f) drawRect(CreateFlash, alpha = create * 0.8f)
+        val deleting = deleteTint.value
+        if (deleting > 0f) drawRect(DeleteFlash, alpha = deleting)
+    }
 }
 
 // Timeline positions in the editor: mm:ss, growing to h:mm:ss past an hour.
