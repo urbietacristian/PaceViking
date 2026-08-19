@@ -7,6 +7,8 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -29,6 +31,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
@@ -38,9 +41,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
@@ -51,10 +60,15 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.paceviking.data.*
+import com.example.paceviking.ui.theme.CreateFlash
 import com.example.paceviking.ui.theme.DangerRed
+import com.example.paceviking.ui.theme.DeleteFlash
 import com.example.paceviking.ui.theme.PaceVikingTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableColumn
 import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private val viewModel: WorkoutViewModel by viewModels()
@@ -244,7 +258,55 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
             )
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(16.dp).verticalScroll(rememberScrollState())) {
+        val scrollState = rememberScrollState()
+        val scope = rememberCoroutineScope()
+        // Bounds of the scroll viewport (captured before verticalScroll, so the
+        // size is the visible one) — needed to centre a duplicated phase.
+        var viewportCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+        val scrollTargetId = viewModel.pendingScrollPhaseId.value
+        val highlightId = viewModel.highlightPhaseId.value
+        val deletingPhaseId = viewModel.deletingPhaseId.value
+        val deletingBlockKey = viewModel.deletingBlockKey.value
+
+        // Deletions are committed once the red flash has played; the flash
+        // itself lives in the card, keyed to these ids.
+        LaunchedEffect(deletingPhaseId) {
+            if (deletingPhaseId != null) {
+                delay(DELETE_EXIT_MS)
+                viewModel.commitPhaseDeletion()
+            }
+        }
+        LaunchedEffect(deletingBlockKey) {
+            if (deletingBlockKey != null) {
+                delay(DELETE_EXIT_MS)
+                viewModel.commitBlockDeletion()
+            }
+        }
+        LaunchedEffect(highlightId) {
+            if (highlightId != null) {
+                delay(CREATE_FLASH_MS + 200)
+                viewModel.clearHighlight()
+            }
+        }
+
+        val centerOnPhase: (LayoutCoordinates) -> Unit = { coords ->
+            val viewport = viewportCoords
+            if (viewport != null && viewport.isAttached && coords.isAttached) {
+                val relativeY = viewport.localPositionOf(coords, Offset.Zero).y
+                val centred = scrollState.value + relativeY - (viewport.size.height - coords.size.height) / 2f
+                val target = centred.roundToInt().coerceIn(0, scrollState.maxValue)
+                scope.launch { scrollState.animateScrollTo(target) }
+            }
+            viewModel.clearPendingScroll()
+        }
+
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .padding(16.dp)
+                .onGloballyPositioned { viewportCoords = it }
+                .verticalScroll(scrollState)
+        ) {
             OutlinedTextField(
                 value = editor.title,
                 onValueChange = { viewModel.updateEditorTitle(it) },
@@ -305,9 +367,13 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                             PhaseItem(
                                 phase = phase,
                                 timeRange = rangeLabel(blockStart, phase.durationSeconds),
-                                onRemove = { viewModel.removeEditorPhase(blockIndex, 0) },
+                                onRemove = { viewModel.requestRemoveEditorPhase(blockIndex, 0) },
+                                onDuplicate = { viewModel.duplicateEditorPhase(blockIndex, 0) },
                                 onUpdate = { updated -> viewModel.updateEditorPhase(blockIndex, 0, updated) },
-                                dragHandle = handle
+                                dragHandle = handle,
+                                onPlaced = if (phase.id == scrollTargetId) centerOnPhase else null,
+                                isNew = phase.id == highlightId,
+                                isDeleting = phase.id == deletingPhaseId
                             )
                         }
                     } else {
@@ -316,13 +382,19 @@ fun SessionEditorScreen(viewModel: WorkoutViewModel) {
                             startSeconds = blockStart,
                             dragHandle = handle,
                             onRepetitionsChange = { viewModel.updateBlockRepetitions(blockIndex, it) },
-                            onRemoveBlock = { viewModel.removeEditorBlock(blockIndex) },
+                            onRemoveBlock = { viewModel.requestRemoveEditorBlock(blockIndex) },
                             onAddPhase = { viewModel.addPhaseToBlock(blockIndex) },
                             onUpdatePhase = { phaseIndex, updated ->
                                 viewModel.updateEditorPhase(blockIndex, phaseIndex, updated)
                             },
-                            onRemovePhase = { phaseIndex -> viewModel.removeEditorPhase(blockIndex, phaseIndex) },
-                            onMovePhase = { from, to -> viewModel.movePhaseInBlock(blockIndex, from, to) }
+                            onRemovePhase = { phaseIndex -> viewModel.requestRemoveEditorPhase(blockIndex, phaseIndex) },
+                            onDuplicatePhase = { phaseIndex -> viewModel.duplicateEditorPhase(blockIndex, phaseIndex) },
+                            onMovePhase = { from, to -> viewModel.movePhaseInBlock(blockIndex, from, to) },
+                            scrollTargetPhaseId = scrollTargetId,
+                            onTargetPlaced = centerOnPhase,
+                            highlightPhaseId = highlightId,
+                            deletingPhaseId = deletingPhaseId,
+                            isDeleting = block.key == deletingBlockKey
                         )
                     }
                 }
@@ -353,8 +425,14 @@ fun PhaseItem(
     // "mm:ss → mm:ss": when this phase starts and ends on the session timeline.
     timeRange: String,
     onRemove: () -> Unit,
+    onDuplicate: () -> Unit,
     onUpdate: (WorkoutPhase) -> Unit,
-    dragHandle: (@Composable () -> Unit)? = null
+    dragHandle: (@Composable () -> Unit)? = null,
+    // Set only on a just-created phase: reports the card's bounds so the
+    // editor can scroll it into the middle of the screen.
+    onPlaced: ((LayoutCoordinates) -> Unit)? = null,
+    isNew: Boolean = false,
+    isDeleting: Boolean = false
 ) {
     val minutes = phase.durationSeconds / 60
     val seconds = phase.durationSeconds % 60
@@ -370,7 +448,15 @@ fun PhaseItem(
         mutableStateOf(phase.speedKmh?.let { formatSpeedForEditor(it) } ?: "")
     }
 
-    Card(modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth()) {
+    val haptics = LocalHapticFeedback.current
+    Card(
+        modifier = Modifier
+            .padding(vertical = 4.dp)
+            .fillMaxWidth()
+            .then(onPlaced?.let { Modifier.onGloballyPositioned(it) } ?: Modifier)
+            .deleteExit(isDeleting),
+        colors = CardDefaults.cardColors(containerColor = editorCardColor(isNew, isDeleting))
+    ) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 dragHandle?.invoke()
@@ -389,7 +475,20 @@ fun PhaseItem(
                     style = MaterialTheme.typography.labelMedium,
                     color = Color.Gray
                 )
-                IconButton(onClick = onRemove) {
+                IconButton(onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                    onDuplicate()
+                }) {
+                    Icon(Icons.Default.ContentCopy, contentDescription = "Duplicar fase", tint = Color.Gray)
+                }
+                IconButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.Reject)
+                        onRemove()
+                    },
+                    // Ignore extra taps while the delete animation plays out.
+                    enabled = !isDeleting
+                ) {
                     Icon(Icons.Default.Delete, contentDescription = "Eliminar fase", tint = Color.Gray)
                 }
             }
@@ -466,10 +565,23 @@ fun BlockItem(
     onAddPhase: () -> Unit,
     onUpdatePhase: (Int, WorkoutPhase) -> Unit,
     onRemovePhase: (Int) -> Unit,
-    onMovePhase: (Int, Int) -> Unit
+    onDuplicatePhase: (Int) -> Unit,
+    onMovePhase: (Int, Int) -> Unit,
+    scrollTargetPhaseId: Long?,
+    onTargetPlaced: (LayoutCoordinates) -> Unit,
+    highlightPhaseId: Long?,
+    deletingPhaseId: Long?,
+    isDeleting: Boolean
 ) {
+    val haptics = LocalHapticFeedback.current
+    // A block flashes green when its first (creating) phase is the new one.
+    val isNew = block.phases.size == 1 && block.phases.first().id == highlightPhaseId
     Card(
-        modifier = Modifier.padding(vertical = 4.dp).fillMaxWidth(),
+        modifier = Modifier
+            .padding(vertical = 4.dp)
+            .fillMaxWidth()
+            .deleteExit(isDeleting),
+        colors = CardDefaults.cardColors(containerColor = editorCardColor(isNew, isDeleting)),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
     ) {
         val roundSeconds = block.phases.sumOf { it.durationSeconds }
@@ -505,7 +617,13 @@ fun BlockItem(
                 ) {
                     Text("+", fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 }
-                IconButton(onClick = onRemoveBlock) {
+                IconButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.Reject)
+                        onRemoveBlock()
+                    },
+                    enabled = !isDeleting
+                ) {
                     Icon(Icons.Default.Delete, contentDescription = "Eliminar bloque", tint = Color.Gray)
                 }
             }
@@ -524,7 +642,6 @@ fun BlockItem(
                 start
             }
             // Nested reorder scope: each phase's handle moves it within this block.
-            val haptics = LocalHapticFeedback.current
             ReorderableColumn(
                 list = block.phases,
                 onSettle = { from, to -> onMovePhase(from, to) },
@@ -539,7 +656,12 @@ fun BlockItem(
                             phase.durationSeconds
                         ),
                         onRemove = { onRemovePhase(phaseIndex) },
+                        onDuplicate = { onDuplicatePhase(phaseIndex) },
                         onUpdate = { updated -> onUpdatePhase(phaseIndex, updated) },
+                        onPlaced = if (phase.id == scrollTargetPhaseId) onTargetPlaced else null,
+                        // The block itself already flashes for its first phase.
+                        isNew = !isNew && phase.id == highlightPhaseId,
+                        isDeleting = phase.id == deletingPhaseId,
                         dragHandle = {
                             IconButton(
                                 onClick = {},
@@ -575,6 +697,68 @@ private fun formatSpeedForEditor(speed: Double): String =
     if (speed % 1.0 == 0.0) speed.toInt().toString() else String.format(Locale.US, "%.1f", speed)
 
 private fun formatSpeedKmh(speed: Double): String = String.format(Locale.US, "%.1f km/h", speed)
+
+// Editor feedback timings: a green flash fading out on creation; on deletion a
+// red wash, then the card slides off to the right and collapses (pulling the
+// next card up) before it actually leaves the list.
+private const val CREATE_FLASH_MS = 700L
+private const val DELETE_TINT_MS = 150
+private const val DELETE_EXIT_MS = 340L
+// Fractions of the exit animation spent sliding out and collapsing; they
+// overlap so the card starts making room before it has fully left.
+private const val DELETE_SLIDE_FRACTION = 0.6f
+private const val DELETE_COLLAPSE_START = 0.45f
+
+/**
+ * Exit animation for a card being deleted: it slides to the right while fading
+ * out, and its reported height shrinks to zero so the cards below travel up
+ * into the freed space.
+ */
+@Composable
+private fun Modifier.deleteExit(isDeleting: Boolean): Modifier {
+    val progress = remember { Animatable(0f) }
+    LaunchedEffect(isDeleting) {
+        if (isDeleting) progress.animateTo(1f, tween(DELETE_EXIT_MS.toInt(), easing = FastOutLinearInEasing))
+        else progress.snapTo(0f)
+    }
+    if (progress.value == 0f) return this
+    val slide = (progress.value / DELETE_SLIDE_FRACTION).coerceAtMost(1f)
+    val collapse =
+        ((progress.value - DELETE_COLLAPSE_START) / (1f - DELETE_COLLAPSE_START)).coerceIn(0f, 1f)
+    return this
+        .graphicsLayer {
+            translationX = size.width * slide
+            alpha = 1f - slide
+        }
+        .layout { measurable, constraints ->
+            val placeable = measurable.measure(constraints)
+            layout(placeable.width, (placeable.height * (1f - collapse)).roundToInt()) {
+                placeable.place(0, 0)
+            }
+        }
+}
+
+/**
+ * Card background for an editor card: tinted green right after creation (fading
+ * back to the default) and washed red while it is being deleted.
+ */
+@Composable
+private fun editorCardColor(isNew: Boolean, isDeleting: Boolean): Color {
+    val base = CardDefaults.cardColors().containerColor
+    val createFlash = remember { Animatable(0f) }
+    LaunchedEffect(isNew) {
+        if (isNew) {
+            createFlash.snapTo(1f)
+            createFlash.animateTo(0f, tween(CREATE_FLASH_MS.toInt(), easing = LinearEasing))
+        }
+    }
+    val deleteTint by animateFloatAsState(
+        targetValue = if (isDeleting) 1f else 0f,
+        animationSpec = tween(DELETE_TINT_MS),
+        label = "deleteTint"
+    )
+    return lerp(lerp(base, CreateFlash, createFlash.value * 0.8f), DeleteFlash, deleteTint)
+}
 
 // Timeline positions in the editor: mm:ss, growing to h:mm:ss past an hour.
 private fun formatClock(totalSeconds: Int): String {

@@ -62,6 +62,23 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     private val _editorState = mutableStateOf<EditorState?>(null)
     val editorState: State<EditorState?> = _editorState
 
+    // Id of a just-created phase the editor should scroll into view; cleared
+    // once it has been centred.
+    private val _pendingScrollPhaseId = mutableStateOf<Long?>(null)
+    val pendingScrollPhaseId: State<Long?> = _pendingScrollPhaseId
+
+    // Just-created phase to flash green; cleared by the editor once the flash
+    // has played.
+    private val _highlightPhaseId = mutableStateOf<Long?>(null)
+    val highlightPhaseId: State<Long?> = _highlightPhaseId
+
+    // Deletions are deferred so the card can flash red first: the editor waits
+    // out the animation and then calls the matching commit.
+    private val _deletingPhaseId = mutableStateOf<Long?>(null)
+    val deletingPhaseId: State<Long?> = _deletingPhaseId
+    private val _deletingBlockKey = mutableStateOf<Long?>(null)
+    val deletingBlockKey: State<Long?> = _deletingBlockKey
+
     // One-shot message shown as a snackbar.
     private val _userMessage = mutableStateOf<String?>(null)
     val userMessage: State<String?> = _userMessage
@@ -140,6 +157,13 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // Editor
+    private fun resetEditorFeedback() {
+        _pendingScrollPhaseId.value = null
+        _highlightPhaseId.value = null
+        _deletingPhaseId.value = null
+        _deletingBlockKey.value = null
+    }
+
     fun openEditor(session: WorkoutSession) {
         viewModelScope.launch {
             val blocks = dao.getBlocksWithPhasesForSession(session.id).map { entry ->
@@ -150,12 +174,14 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
                     isBlock = entry.block.repetitions > 1 || entry.phases.size > 1
                 )
             }
+            resetEditorFeedback()
             _editorState.value = EditorState(session, session.title, blocks)
         }
     }
 
     fun openEditorForNew() {
         val session = WorkoutSession(title = "Nueva Sesión")
+        resetEditorFeedback()
         _editorState.value = EditorState(session, session.title, emptyList())
     }
 
@@ -172,18 +198,29 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         orderIndex = 0
     )
 
+    // Every creation announces the new phase so the editor can scroll it into
+    // view and flash it.
+    private fun announceCreated(phase: WorkoutPhase) {
+        _pendingScrollPhaseId.value = phase.id
+        _highlightPhaseId.value = phase.id
+    }
+
     fun addEditorPhase() {
         val editor = _editorState.value ?: return
+        val phase = newDefaultPhase()
         _editorState.value = editor.copy(
-            blocks = editor.blocks + EditorBlock(nextBlockKey(), 1, listOf(newDefaultPhase()), isBlock = false)
+            blocks = editor.blocks + EditorBlock(nextBlockKey(), 1, listOf(phase), isBlock = false)
         )
+        announceCreated(phase)
     }
 
     fun addEditorBlock() {
         val editor = _editorState.value ?: return
+        val phase = newDefaultPhase()
         _editorState.value = editor.copy(
-            blocks = editor.blocks + EditorBlock(nextBlockKey(), 2, listOf(newDefaultPhase()), isBlock = true)
+            blocks = editor.blocks + EditorBlock(nextBlockKey(), 2, listOf(phase), isBlock = true)
         )
+        announceCreated(phase)
     }
 
     /** Moves a top-level block/phase from one position to another (drag reorder). */
@@ -215,16 +252,88 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         })
     }
 
-    fun removeEditorBlock(blockIndex: Int) {
-        val editor = _editorState.value ?: return
-        _editorState.value = editor.copy(blocks = editor.blocks.filterIndexed { i, _ -> i != blockIndex })
-    }
-
     fun addPhaseToBlock(blockIndex: Int) {
         val editor = _editorState.value ?: return
+        val phase = newDefaultPhase()
         _editorState.value = editor.copy(blocks = editor.blocks.mapIndexed { i, block ->
-            if (i == blockIndex) block.copy(phases = block.phases + newDefaultPhase()) else block
+            if (i == blockIndex) block.copy(phases = block.phases + phase) else block
         })
+        announceCreated(phase)
+    }
+
+    /**
+     * Inserts an identical copy right after the given phase. A standalone phase
+     * is duplicated as another standalone phase (its own block); a phase inside
+     * a block is duplicated within that block. The copy's temp id is published
+     * as [pendingScrollPhaseId] so the editor can scroll it into view.
+     */
+    fun duplicateEditorPhase(blockIndex: Int, phaseIndex: Int) {
+        val editor = _editorState.value ?: return
+        val block = editor.blocks.getOrNull(blockIndex) ?: return
+        val original = block.phases.getOrNull(phaseIndex) ?: return
+        val copy = original.copy(id = nextTempPhaseId())
+        val blocks = if (!block.isBlock) {
+            editor.blocks.toMutableList().apply {
+                add(blockIndex + 1, EditorBlock(nextBlockKey(), 1, listOf(copy), isBlock = false))
+            }
+        } else {
+            editor.blocks.mapIndexed { i, b ->
+                if (i != blockIndex) b
+                else b.copy(phases = b.phases.toMutableList().apply { add(phaseIndex + 1, copy) })
+            }
+        }
+        _editorState.value = editor.copy(blocks = blocks)
+        announceCreated(copy)
+    }
+
+    /** Cleared by the editor once the new phase has been scrolled to. */
+    fun clearPendingScroll() {
+        _pendingScrollPhaseId.value = null
+    }
+
+    /** Cleared by the editor once the creation flash has played. */
+    fun clearHighlight() {
+        _highlightPhaseId.value = null
+    }
+
+    /** Marks a phase as deleting; [commitPhaseDeletion] removes it for good. */
+    fun requestRemoveEditorPhase(blockIndex: Int, phaseIndex: Int) {
+        // A deletion still playing is committed now, so its card can't be left
+        // tinted red forever by a second delete tap.
+        commitPhaseDeletion()
+        val editor = _editorState.value ?: return
+        val phase = editor.blocks.getOrNull(blockIndex)?.phases?.getOrNull(phaseIndex) ?: return
+        _deletingPhaseId.value = phase.id
+    }
+
+    fun commitPhaseDeletion() {
+        val id = _deletingPhaseId.value ?: return
+        _deletingPhaseId.value = null
+        val editor = _editorState.value ?: return
+        // Matched by id, not index: the list may have been reordered while the
+        // deletion animation played. Removing a block's last phase removes the
+        // block itself.
+        _editorState.value = editor.copy(blocks = editor.blocks.mapNotNull { block ->
+            if (block.phases.none { it.id == id }) block
+            else {
+                val remaining = block.phases.filter { it.id != id }
+                if (remaining.isEmpty()) null else block.copy(phases = remaining)
+            }
+        })
+    }
+
+    /** Marks a block as deleting; [commitBlockDeletion] removes it for good. */
+    fun requestRemoveEditorBlock(blockIndex: Int) {
+        commitBlockDeletion()
+        val editor = _editorState.value ?: return
+        _deletingBlockKey.value = editor.blocks.getOrNull(blockIndex)?.key ?: return
+    }
+
+    fun commitBlockDeletion() {
+        val key = _deletingBlockKey.value ?: return
+        _deletingBlockKey.value = null
+        val editor = _editorState.value ?: return
+        _editorState.value = editor.copy(blocks = editor.blocks.filter { it.key != key })
     }
 
     fun updateEditorPhase(blockIndex: Int, phaseIndex: Int, phase: WorkoutPhase) {
@@ -235,19 +344,11 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
         })
     }
 
-    fun removeEditorPhase(blockIndex: Int, phaseIndex: Int) {
-        val editor = _editorState.value ?: return
-        // Removing a block's last phase removes the block itself.
-        _editorState.value = editor.copy(blocks = editor.blocks.mapIndexedNotNull { i, block ->
-            if (i != blockIndex) block
-            else {
-                val remaining = block.phases.filterIndexed { j, _ -> j != phaseIndex }
-                if (remaining.isEmpty()) null else block.copy(phases = remaining)
-            }
-        })
-    }
 
     fun saveEditor() {
+        // Saving mid-animation must not resurrect a phase already deleted.
+        commitPhaseDeletion()
+        commitBlockDeletion()
         val editor = _editorState.value ?: return
         val allPhases = editor.blocks.flatMap { it.phases }
         if (allPhases.any { it.durationSeconds <= 0 }) {
