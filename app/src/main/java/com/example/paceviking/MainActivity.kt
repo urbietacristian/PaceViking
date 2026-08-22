@@ -531,16 +531,26 @@ fun PhaseItem(
         Column(modifier = Modifier.editorFlash(isNew, isDeleting).padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 dragHandle?.invoke()
-                // Phase Type Toggle
-                Text(
-                    text = phase.type.name,
-                    modifier = Modifier.weight(1f).clickable {
-                        val nextType = PhaseType.entries[(phase.type.ordinal + 1) % PhaseType.entries.size]
-                        onUpdate(phase.copy(type = nextType))
-                    },
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
+                // Phase Type Toggle, in the same per-type accent the workout
+                // screen uses, so a card is identifiable by colour alone.
+                val typeColor = phaseTypeColor(phase.type)
+                Box(modifier = Modifier.weight(1f)) {
+                    Surface(
+                        color = typeColor.copy(alpha = 0.15f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.clickable {
+                            val nextType = PhaseType.entries[(phase.type.ordinal + 1) % PhaseType.entries.size]
+                            onUpdate(phase.copy(type = nextType))
+                        }
+                    ) {
+                        Text(
+                            text = phase.type.name,
+                            fontWeight = FontWeight.Bold,
+                            color = typeColor,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                }
                 Text(
                     text = timeRange,
                     style = MaterialTheme.typography.labelMedium,
@@ -600,7 +610,25 @@ fun PhaseItem(
                     onUpdate(phase.copy(targetHrZone = nextZone))
                 }) {
                     Text("Zona Cardíaca", style = MaterialTheme.typography.labelSmall)
-                    Text(phase.targetHrZone.name, fontWeight = FontWeight.Medium)
+                    // Same zone ramp as the workout screen, so the colour the
+                    // user picks here is the one they will see while running.
+                    val zoneColor = hrZoneIndex(phase.targetHrZone)?.let(::hrZoneColor)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (zoneColor != null) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(zoneColor)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        Text(
+                            text = phase.targetHrZone.name,
+                            fontWeight = FontWeight.Medium,
+                            color = zoneColor ?: LocalContentColor.current
+                        )
+                    }
                 }
             }
             OutlinedTextField(
@@ -861,6 +889,58 @@ private fun phaseTypeColor(type: PhaseType): Color = when (type) {
     PhaseType.COOL_DOWN -> Color(0xFFCE93D8)
 }
 
+// Heart-rate zone ramp, matching the usual sports-watch code: cyan, green,
+// yellow, orange, red. Indexed 1..5 like [hrZoneIndex].
+private fun hrZoneColor(index: Int): Color = when (index) {
+    1 -> Color(0xFF4FC3F7)
+    2 -> Color(0xFF66BB6A)
+    3 -> Color(0xFFFDD835)
+    4 -> Color(0xFFFFA726)
+    else -> Color(0xFFEF5350)
+}
+
+// 1..5 for the numbered zones, null for NONE — a null zone hides its card.
+private fun hrZoneIndex(zone: HrZone): Int? = when (zone) {
+    HrZone.ZONE_1 -> 1
+    HrZone.ZONE_2 -> 2
+    HrZone.ZONE_3 -> 3
+    HrZone.ZONE_4 -> 4
+    HrZone.ZONE_5 -> 5
+    HrZone.NONE -> null
+}
+
+// One of the two metric cards under the phase type: small label on top, the
+// value below. SpaceBetween + fillMaxHeight keeps both cards' labels and
+// values aligned even though their contents have different heights.
+@Composable
+private fun PhaseMetricCard(
+    label: String,
+    accent: Color,
+    modifier: Modifier = Modifier,
+    // The zone card labels itself in its own zone color instead of the phase
+    // accent, so the card and the scale below it read as one thing.
+    labelColor: Color = accent.copy(alpha = 0.75f),
+    value: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        color = accent.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier.fillMaxHeight()
+    ) {
+        Column(
+            modifier = Modifier.fillMaxHeight().padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = labelColor
+            )
+            value()
+        }
+    }
+}
+
 @Composable
 fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val currentEntry by viewModel.currentPhase.collectAsStateWithLifecycle()
@@ -1017,35 +1097,71 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
             fontWeight = FontWeight.ExtraBold
         )
         
-        Surface(
-            color = phaseColor.copy(alpha = 0.1f),
-            shape = MaterialTheme.shapes.medium,
-            modifier = Modifier.padding(top = 8.dp)
-        ) {
-            Text(
-                text = "Zona Objetivo: ${phase?.targetHrZone?.name}",
-                style = MaterialTheme.typography.titleMedium,
-                color = phaseColor,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
-        }
-
-        phase?.speedKmh?.let { speed ->
-            Surface(
-                color = phaseColor.copy(alpha = 0.1f),
-                shape = MaterialTheme.shapes.medium,
-                modifier = Modifier.padding(top = 8.dp)
+        // Speed and target zone get the same visual weight as the phase type:
+        // two equal cards side by side. Either one disappears when it has no
+        // value, and the survivor then takes the full width on its own.
+        val zoneIndex = phase?.targetHrZone?.let(::hrZoneIndex)
+        if (phase?.speedKmh != null || zoneIndex != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp)
+                    .height(IntrinsicSize.Min),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text(
-                    text = "Velocidad: ${formatSpeedKmh(speed)}",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = phaseColor,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                )
+                phase?.speedKmh?.let { speed ->
+                    PhaseMetricCard(label = "VELOCIDAD", accent = phaseColor, modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.Bottom) {
+                            Text(
+                                text = String.format(Locale.US, "%.1f", speed),
+                                style = MaterialTheme.typography.displaySmall,
+                                fontWeight = FontWeight.Bold,
+                                color = phaseColor
+                            )
+                            Text(
+                                text = " km/h",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = phaseColor.copy(alpha = 0.75f),
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                        }
+                    }
+                }
+                if (zoneIndex != null) {
+                    PhaseMetricCard(
+                        label = "ZONA $zoneIndex",
+                        accent = phaseColor,
+                        labelColor = hrZoneColor(zoneIndex),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        // Position on the 1..5 scale reads at a glance while
+                        // running — no text to parse on a moving treadmill.
+                        // Every segment keeps its own zone color, dimmed except
+                        // the target one, so the ramp stays recognisable.
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            repeat(5) { i ->
+                                val zoneColor = hrZoneColor(i + 1)
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(14.dp)
+                                        .clip(RoundedCornerShape(3.dp))
+                                        .background(
+                                            if (i + 1 == zoneIndex) zoneColor
+                                            else zoneColor.copy(alpha = 0.13f)
+                                        )
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        Spacer(modifier = Modifier.height(64.dp))
+        Spacer(modifier = Modifier.height(48.dp))
 
         Box(
             modifier = Modifier
