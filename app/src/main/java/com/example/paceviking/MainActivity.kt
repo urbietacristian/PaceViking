@@ -72,6 +72,7 @@ import com.example.paceviking.ui.theme.DeleteFlash
 import com.example.paceviking.ui.theme.PaceVikingTheme
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableColumn
 import sh.calvin.reorderable.ReorderableItem
@@ -998,7 +999,13 @@ private suspend fun Animatable<Float, AnimationVector1D>.flashOut() {
 fun WorkoutScreen(viewModel: WorkoutViewModel) {
     val currentEntry by viewModel.currentPhase.collectAsStateWithLifecycle()
     val phase = currentEntry?.phase
-    val timeLeft by viewModel.timeLeftSeconds.collectAsStateWithLifecycle()
+    // Held as State and never read here. The countdown changes once a second,
+    // so reading it in this scope would put the whole screen — every metric
+    // card, the preview, all the segments of the session bar — in that state's
+    // restart scope and rebuild it at that rate, which is exactly the per-frame
+    // work the flash animations below go to such lengths to avoid. Only the two
+    // leaves that show the time ([PhaseClock], [SessionProgress]) read the value.
+    val timeLeftState = viewModel.timeLeftSeconds.collectAsStateWithLifecycle()
     val isPaused by viewModel.isPaused.collectAsStateWithLifecycle()
     val currentIdx by viewModel.currentPhaseIndex.collectAsStateWithLifecycle()
     val phases by viewModel.currentPhases.collectAsStateWithLifecycle()
@@ -1092,37 +1099,9 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
     val phaseColor = phase?.type?.let { phaseTypeColor(it) } ?: MaterialTheme.colorScheme.onBackground
 
-    // Whole-session progress: elapsed time over total session time.
-    val totalSessionSeconds = remember(phases) { phases.sumOf { it.phase.durationSeconds } }
-    // Cumulative start second of each phase (size + 1: last entry is the total),
-    // used to map overall progress onto each segment of the bar.
-    val phaseStartsSeconds = remember(phases) { phases.runningFold(0) { acc, p -> acc + p.phase.durationSeconds } }
-    val elapsedSeconds = (phases.take(currentIdx.coerceAtLeast(0)).sumOf { it.phase.durationSeconds } +
-        ((phase?.durationSeconds ?: 0) - timeLeft)).coerceAtLeast(0)
-    val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
-    // Same one-tick linear tween as the phase fill, so both bars advance
-    // continuously instead of stepping once per second.
-    val animatedProgress by animateFloatAsState(
-        targetValue = sessionProgress,
-        animationSpec = if (sessionProgress == 0f) snap() else tween(1000, easing = LinearEasing),
-        label = "sessionProgress"
-    )
-
-    // Current phase progress, drawn as the clock's own background: the tinted
-    // fill starts empty and grows to the right as the phase advances.
+    // Both progress bars are computed inside the leaves that read the clock —
+    // the phase fill in [PhaseClock], the session bar in [SessionProgress].
     val phaseDuration = phase?.durationSeconds ?: 0
-    val phaseProgress = if (phaseDuration > 0) {
-        ((phaseDuration - timeLeft).toFloat() / phaseDuration).coerceIn(0f, 1f)
-    } else 0f
-    // The engine ticks once per second, so the raw value moves in steps. A
-    // linear tween exactly one tick long turns those steps into a continuous
-    // slide; a new phase (progress back to 0) snaps instead of rewinding.
-    val animatedPhaseProgress by animateFloatAsState(
-        targetValue = phaseProgress,
-        animationSpec = if (phaseProgress == 0f) snap() else tween(1000, easing = LinearEasing),
-        label = "phaseProgress"
-    )
-    val fillColor = phaseColor.copy(alpha = 0.30f)
 
     // Three parallel timelines, each read in a draw lambda only — never in this
     // composable, which is full of text that must not recompose once per frame.
@@ -1137,13 +1116,26 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
     // Warning pulses before the change, in the colour of the phase that is
     // coming, with the emphasis on its preview.
-    LaunchedEffect(currentIdx, timeLeft, isPaused, isRunning) {
-        if (!isRunning || isPaused || timeLeft !in PRE_FLASH_SECONDS) return@LaunchedEffect
-        if (nextPhase == null || phaseDuration <= timeLeft) return@LaunchedEffect
-        flashColor = phaseTypeColor(nextPhase.phase.type)
-        coroutineScope {
-            launch { flash.pulse() }
-            launch { previewFlash.pulse() }
+    //
+    // The seconds arrive as a snapshotFlow rather than as an effect key: keying
+    // on them restarted this effect (cancelling the coroutine and launching a
+    // new one) on every tick, whether or not the new second was one that
+    // pulses. collectLatest keeps the behaviour that made that work — the pulse
+    // still in flight is cancelled when the next second lands.
+    //
+    // Everything the block captures is a key or derived from one: [nextPhase]
+    // from the phase list and the index, [phaseDuration] from [phase]. Without
+    // the per-second restart there is nothing else to refresh a stale capture.
+    LaunchedEffect(phases, currentIdx, phase, isPaused, isRunning) {
+        if (!isRunning || isPaused) return@LaunchedEffect
+        snapshotFlow { timeLeftState.value }.collectLatest { timeLeft ->
+            if (timeLeft !in PRE_FLASH_SECONDS) return@collectLatest
+            if (nextPhase == null || phaseDuration <= timeLeft) return@collectLatest
+            flashColor = phaseTypeColor(nextPhase.phase.type)
+            coroutineScope {
+                launch { flash.pulse() }
+                launch { previewFlash.pulse() }
+            }
         }
     }
 
@@ -1161,10 +1153,12 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
     // Once the change flash has faded, the speed alone pulses again, twice —
     // these land on a screen that is otherwise calm.
-    LaunchedEffect(currentIdx, timeLeft, isPaused, isRunning) {
+    LaunchedEffect(phases, currentIdx, phase, isPaused, isRunning) {
         if (!isRunning || isPaused || currentIdx <= 0 || phase?.speedKmh == null) return@LaunchedEffect
-        if (phaseDuration - timeLeft !in SPEED_REMINDER_SECONDS || timeLeft < 1) return@LaunchedEffect
-        speedFlash.pulse()
+        snapshotFlow { timeLeftState.value }.collectLatest { timeLeft ->
+            if (phaseDuration - timeLeft !in SPEED_REMINDER_SECONDS || timeLeft < 1) return@collectLatest
+            speedFlash.pulse()
+        }
     }
 
     Box(
@@ -1279,34 +1273,11 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
         Spacer(modifier = Modifier.height(48.dp))
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(20.dp))
-                .background(phaseColor.copy(alpha = 0.10f))
-        ) {
-            // Drawn instead of sized: the clock's height comes from the text,
-            // so the fill has to match the parent and paint a fraction of it.
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .drawBehind {
-                        drawRect(
-                            color = fillColor,
-                            size = Size(size.width * animatedPhaseProgress, size.height)
-                        )
-                    }
-            )
-            Text(
-                text = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60),
-                style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
-                fontWeight = FontWeight.Thin,
-                color = Color(0xFFF5F5F5),
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(vertical = 8.dp)
-            )
-        }
+        PhaseClock(
+            timeLeftState = timeLeftState,
+            phaseDurationSeconds = phaseDuration,
+            phaseColor = phaseColor
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -1411,61 +1382,183 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         }
         }
 
-        // Session overview: one segment per phase, width proportional to its
-        // duration, filled left-to-right as the whole session advances.
-        Column(
+        SessionProgress(
+            timeLeftState = timeLeftState,
+            phases = phases,
+            currentIdx = currentIdx,
+            phaseDurationSeconds = phaseDuration,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
                 .padding(horizontal = 24.dp, vertical = 8.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().height(6.dp),
-                horizontalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                phases.forEachIndexed { index, p ->
-                    val segmentColor = phaseTypeColor(p.phase.type)
-                    val startFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index].toFloat() / totalSessionSeconds else 0f
-                    val endFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index + 1].toFloat() / totalSessionSeconds else 0f
-                    // The fill is drawn rather than laid out: reading the
-                    // animation inside drawBehind keeps the per-frame work to
-                    // the draw phase, with no recomposition or re-layout.
-                    Box(
-                        modifier = Modifier
-                            .weight(p.phase.durationSeconds.toFloat().coerceAtLeast(1f))
-                            .fillMaxHeight()
-                            .clip(RoundedCornerShape(3.dp))
-                            .background(segmentColor.copy(alpha = 0.25f))
-                            .drawBehind {
-                                val fillFraction = if (endFraction > startFraction) {
-                                    ((animatedProgress - startFraction) / (endFraction - startFraction))
-                                        .coerceIn(0f, 1f)
-                                } else 0f
-                                if (fillFraction > 0f) {
-                                    drawRect(
-                                        color = segmentColor,
-                                        size = Size(size.width * fillFraction, size.height)
-                                    )
-                                }
-                            }
+        )
+    }
+}
+
+/**
+ * The countdown and the fill that tracks the current phase behind it.
+ *
+ * Split out of [WorkoutScreen] for one reason: this is where the seconds are
+ * read, so a tick invalidates this leaf instead of the whole screen. What is
+ * left recomposing once a second is a Box and the clock's own text, which has
+ * to be re-measured anyway because its glyphs changed.
+ */
+@Composable
+private fun PhaseClock(
+    timeLeftState: State<Int>,
+    phaseDurationSeconds: Int,
+    phaseColor: Color
+) {
+    val timeLeft = timeLeftState.value
+    val phaseProgress = if (phaseDurationSeconds > 0) {
+        ((phaseDurationSeconds - timeLeft).toFloat() / phaseDurationSeconds).coerceIn(0f, 1f)
+    } else 0f
+    // The engine ticks once per second, so the raw value moves in steps. A
+    // linear tween exactly one tick long turns those steps into a continuous
+    // slide; a new phase (progress back to 0) snaps instead of rewinding.
+    val animatedPhaseProgress = animateFloatAsState(
+        targetValue = phaseProgress,
+        animationSpec = if (phaseProgress == 0f) snap() else tween(1000, easing = LinearEasing),
+        label = "phaseProgress"
+    )
+    val fillColor = phaseColor.copy(alpha = 0.30f)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(phaseColor.copy(alpha = 0.10f))
+    ) {
+        // Drawn instead of sized: the clock's height comes from the text,
+        // so the fill has to match the parent and paint a fraction of it.
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .drawBehind {
+                    drawRect(
+                        color = fillColor,
+                        size = Size(size.width * animatedPhaseProgress.value, size.height)
                     )
                 }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "${formatMmSs(elapsedSeconds)} / ${formatMmSs(totalSessionSeconds)}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color(0xFF9E9E9E)
-                )
-                Text(
-                    text = "faltan ${formatMmSs((totalSessionSeconds - elapsedSeconds).coerceAtLeast(0))}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Color(0xFF9E9E9E)
-                )
-            }
+        )
+        Text(
+            text = formatMmSs(timeLeft),
+            style = MaterialTheme.typography.displayLarge.copy(fontSize = 120.sp),
+            fontWeight = FontWeight.Thin,
+            color = Color(0xFFF5F5F5),
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(vertical = 8.dp)
+        )
+    }
+}
+
+/**
+ * Session overview: the segmented bar and the elapsed/remaining totals under it.
+ *
+ * The other half of keeping the clock out of [WorkoutScreen]'s restart scope.
+ * The seconds are read here, so this composable is rebuilt once a second — but
+ * all that costs is the two labels, whose text really does change. The bar
+ * itself is [SessionProgressSegments], whose arguments only change with the
+ * session, so it skips; the animation reaches it as a [State] read inside a
+ * draw lambda.
+ */
+@Composable
+private fun SessionProgress(
+    timeLeftState: State<Int>,
+    phases: List<TimelinePhase>,
+    currentIdx: Int,
+    phaseDurationSeconds: Int,
+    modifier: Modifier = Modifier
+) {
+    val totalSessionSeconds = remember(phases) { phases.sumOf { it.phase.durationSeconds } }
+    // Cumulative start second of each phase (size + 1: last entry is the total),
+    // used to map overall progress onto each segment of the bar.
+    val phaseStartsSeconds = remember(phases) {
+        phases.runningFold(0) { acc, p -> acc + p.phase.durationSeconds }
+    }
+    // Entry [currentIdx] of the running fold is already the sum of every phase
+    // before this one, so the elapsed total needs no walk over the list.
+    val phasesBefore = phaseStartsSeconds.getOrElse(currentIdx.coerceAtLeast(0)) { 0 }
+    val elapsedSeconds = (phasesBefore + (phaseDurationSeconds - timeLeftState.value)).coerceAtLeast(0)
+    val sessionProgress = if (totalSessionSeconds > 0) elapsedSeconds.toFloat() / totalSessionSeconds else 0f
+    // Same one-tick linear tween as the phase fill, so both bars advance
+    // continuously instead of stepping once per second.
+    val animatedProgress = animateFloatAsState(
+        targetValue = sessionProgress,
+        animationSpec = if (sessionProgress == 0f) snap() else tween(1000, easing = LinearEasing),
+        label = "sessionProgress"
+    )
+
+    Column(modifier = modifier) {
+        SessionProgressSegments(
+            phases = phases,
+            phaseStartsSeconds = phaseStartsSeconds,
+            totalSessionSeconds = totalSessionSeconds,
+            progress = animatedProgress
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "${formatMmSs(elapsedSeconds)} / ${formatMmSs(totalSessionSeconds)}",
+                style = MaterialTheme.typography.labelMedium,
+                color = Color(0xFF9E9E9E)
+            )
+            Text(
+                text = "faltan ${formatMmSs((totalSessionSeconds - elapsedSeconds).coerceAtLeast(0))}",
+                style = MaterialTheme.typography.labelMedium,
+                color = Color(0xFF9E9E9E)
+            )
+        }
+    }
+}
+
+/**
+ * One segment per phase, width proportional to its duration, filled
+ * left-to-right as the whole session advances.
+ *
+ * [progress] is passed as a [State] and never read here: reading it would tie
+ * the row to the animation and rebuild every segment's modifier chain per
+ * frame. Each segment reads it inside its own drawBehind instead, so a frame of
+ * the animation costs a redraw and neither a recomposition nor a re-layout —
+ * and since nothing else in this composable changes while a session runs, the
+ * row is built once and skipped from then on.
+ */
+@Composable
+private fun SessionProgressSegments(
+    phases: List<TimelinePhase>,
+    phaseStartsSeconds: List<Int>,
+    totalSessionSeconds: Int,
+    progress: State<Float>
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().height(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        phases.forEachIndexed { index, p ->
+            val segmentColor = phaseTypeColor(p.phase.type)
+            val startFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index].toFloat() / totalSessionSeconds else 0f
+            val endFraction = if (totalSessionSeconds > 0) phaseStartsSeconds[index + 1].toFloat() / totalSessionSeconds else 0f
+            Box(
+                modifier = Modifier
+                    .weight(p.phase.durationSeconds.toFloat().coerceAtLeast(1f))
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(segmentColor.copy(alpha = 0.25f))
+                    .drawBehind {
+                        val fillFraction = if (endFraction > startFraction) {
+                            ((progress.value - startFraction) / (endFraction - startFraction))
+                                .coerceIn(0f, 1f)
+                        } else 0f
+                        if (fillFraction > 0f) {
+                            drawRect(
+                                color = segmentColor,
+                                size = Size(size.width * fillFraction, size.height)
+                            )
+                        }
+                    }
+            )
         }
     }
 }
