@@ -33,9 +33,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -66,6 +64,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.paceviking.data.*
+import com.example.paceviking.ui.ContentCopy
+import com.example.paceviking.ui.DragHandle
 import com.example.paceviking.ui.theme.CreateFlash
 import com.example.paceviking.ui.theme.DangerRed
 import com.example.paceviking.ui.theme.DeleteFlash
@@ -827,6 +827,11 @@ private fun Modifier.deleteExit(isDeleting: Boolean): Modifier {
         if (isDeleting) progress.animateTo(1f, tween(DELETE_EXIT_MS.toInt(), easing = FastOutLinearInEasing))
         else progress.snapTo(0f)
     }
+    // Nothing is installed until the card is actually on its way out. Applied
+    // unconditionally these cost every visible card a RenderNode and a layout
+    // wrapper that joins every measure pass, permanently, for an animation that
+    // plays on one card at a time for 340ms.
+    if (!isDeleting) return this
     // The animation value is only read inside the graphicsLayer/layout lambdas,
     // so each frame invalidates draw and layout but never recomposition — a
     // card full of text fields would be far too heavy to rebuild per frame.
@@ -873,20 +878,37 @@ private fun Modifier.editorFlash(isNew: Boolean, isDeleting: Boolean): Modifier 
     }
 }
 
+// Clock strings are built by hand rather than with String.format, which parses
+// its pattern and boxes every argument on each call. formatMmSs runs on every
+// tick of the workout clock — once for the clock itself and three times for the
+// totals under the session bar — and formatClock twice per phase card on every
+// keystroke in the editor.
+private fun StringBuilder.appendTwoDigits(value: Int): StringBuilder {
+    if (value < 10) append('0')
+    return append(value)
+}
+
 // Timeline positions in the editor: mm:ss, growing to h:mm:ss past an hour.
 private fun formatClock(totalSeconds: Int): String {
     val hours = totalSeconds / 3600
-    val minutes = (totalSeconds % 3600) / 60
-    val seconds = totalSeconds % 60
-    return if (hours > 0) String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
-    else String.format(Locale.US, "%02d:%02d", minutes, seconds)
+    val out = StringBuilder(8)
+    if (hours > 0) out.append(hours).append(':')
+    return out
+        .appendTwoDigits((totalSeconds % 3600) / 60)
+        .append(':')
+        .appendTwoDigits(totalSeconds % 60)
+        .toString()
 }
 
 private fun rangeLabel(startSeconds: Int, durationSeconds: Int): String =
     "${formatClock(startSeconds)} → ${formatClock(startSeconds + durationSeconds)}"
 
 private fun formatMmSs(totalSeconds: Int): String =
-    String.format(Locale.US, "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    StringBuilder(5)
+        .appendTwoDigits(totalSeconds / 60)
+        .append(':')
+        .appendTwoDigits(totalSeconds % 60)
+        .toString()
 
 // Bright accent per phase type, shared by the current-phase texts and the
 // segmented session progress bar.
@@ -1605,7 +1627,16 @@ private fun Modifier.flashInvert(
             cornerRadius = CornerRadius(corner.toPx())
         )
     }
-    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+    // The offscreen buffer is what keeps the SrcAtop blend below inside the
+    // content instead of letting it punch through everything underneath — but
+    // it forces a saveLayer on every frame the card is drawn, and the card is
+    // on screen for the whole workout while the flash plays for a few hundred
+    // milliseconds of each phase. Reading [flash] here subscribes the layer to
+    // it, so the buffer is only asked for while there is something to blend.
+    .graphicsLayer {
+        compositingStrategy =
+            if (flash() > 0f) CompositingStrategy.Offscreen else CompositingStrategy.Auto
+    }
     .drawWithContent {
         drawContent()
         val boost = flash()
