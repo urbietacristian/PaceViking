@@ -83,6 +83,13 @@ class WorkoutEngine(context: Context) {
     private var sessionTitle: String = ""
     private var startedAtMillis: Long = 0L
 
+    // Deadline of the current phase on the monotonic clock. Every phase after
+    // the first derives its deadline from this one (not from "now"), so the
+    // whole session runs off a single anchor and per-phase overshoot cannot
+    // accumulate. Pause shifts it; skipping re-anchors it to the present.
+    private var phaseEndElapsed: Long = 0L
+    private var pausedAtElapsed: Long = 0L
+
     /** Claims the engine for a new workout. False if one is already loading/running. */
     fun beginLoading(): Boolean {
         if (_status.value != WorkoutStatus.IDLE) return false
@@ -114,6 +121,7 @@ class WorkoutEngine(context: Context) {
     fun begin() {
         if (_status.value != WorkoutStatus.READY) return
         startedAtMillis = System.currentTimeMillis()
+        phaseEndElapsed = SystemClock.elapsedRealtime() + _timeLeftSeconds.value * 1000L
         _status.value = WorkoutStatus.RUNNING
         startTimer()
     }
@@ -125,16 +133,24 @@ class WorkoutEngine(context: Context) {
         timerJob?.cancel()
         // Skipping always lands running: a paused workout resumes on the new phase.
         _isPaused.value = false
+        // A skip deliberately shortens the session, so the schedule re-anchors
+        // here instead of keeping the discarded time in the timeline.
+        phaseEndElapsed = SystemClock.elapsedRealtime()
         transitionToNextPhase()
     }
 
     fun pause() {
+        if (_isPaused.value) return
+        pausedAtElapsed = SystemClock.elapsedRealtime()
         _isPaused.value = true
         timerJob?.cancel()
     }
 
     fun resume() {
-        if (_status.value != WorkoutStatus.RUNNING) return
+        if (_status.value != WorkoutStatus.RUNNING || !_isPaused.value) return
+        // Push the whole remaining schedule forward by the paused interval so
+        // the pause costs exactly its own length and nothing more.
+        phaseEndElapsed += SystemClock.elapsedRealtime() - pausedAtElapsed
         _isPaused.value = false
         startTimer()
     }
@@ -154,12 +170,12 @@ class WorkoutEngine(context: Context) {
 
     private fun startTimer() {
         timerJob?.cancel()
-        // Anchor the phase end to the real clock so late ticks (backgrounding,
-        // doze) never lose time — remaining is always recomputed from elapsedRealtime.
-        val phaseEndElapsed = SystemClock.elapsedRealtime() + _timeLeftSeconds.value * 1000L
+        // Remaining is always recomputed from the phase deadline on the
+        // monotonic clock, so late ticks (backgrounding, doze) never lose time.
+        val deadline = phaseEndElapsed
         timerJob = scope.launch {
             while (isActive) {
-                val remainingMs = phaseEndElapsed - SystemClock.elapsedRealtime()
+                val remainingMs = deadline - SystemClock.elapsedRealtime()
                 _timeLeftSeconds.value = (((remainingMs + 999) / 1000).coerceAtLeast(0)).toInt()
                 if (remainingMs <= 0) {
                     transitionToNextPhase()
@@ -178,6 +194,11 @@ class WorkoutEngine(context: Context) {
             val nextPhase = _phases.value[nextIndex]
             _currentPhase.value = nextPhase
             _timeLeftSeconds.value = nextPhase.phase.durationSeconds
+            // The new deadline is measured from the phase's *scheduled* end,
+            // not from the moment this tick actually ran: whatever the timer
+            // overshot by is paid back inside this phase instead of being
+            // added to the session's total.
+            phaseEndElapsed += nextPhase.phase.durationSeconds * 1000L
             _phaseChanges.tryEmit(nextIndex to nextPhase)
             startTimer()
         } else {
@@ -192,17 +213,23 @@ class WorkoutEngine(context: Context) {
         }
     }
 
+    /**
+     * Beep and vibrate, off the main thread. Building a [ToneGenerator] opens an
+     * audio track and blocks for as long as the audio path takes to wake up
+     * (easily hundreds of milliseconds); doing that on the main thread froze the
+     * UI at every phase change, right when the new phase's clock appears.
+     */
     private fun alertPhaseChange() {
-        // Three short pulses: 0ms delay, 100ms on, 100ms off, 100ms on, 100ms off, 100ms on
-        val pattern = longArrayOf(0, 100, 100, 100, 100, 100)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(pattern, -1)
-        }
+        scope.launch(Dispatchers.Default) {
+            // Three short pulses: 0ms delay, 100ms on, 100ms off, 100ms on, 100ms off, 100ms on
+            val pattern = longArrayOf(0, 100, 100, 100, 100, 100)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(pattern, -1)
+            }
 
-        scope.launch {
             val toneGen = try {
                 ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME)
             } catch (_: RuntimeException) {

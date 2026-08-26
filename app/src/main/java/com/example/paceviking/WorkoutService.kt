@@ -20,7 +20,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,6 +37,15 @@ class WorkoutService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
     private var observing = false
+
+    // Built once: asking ActivityManager for it is a binder call, and the
+    // ongoing notification is rebuilt every second.
+    private val contentIntent: PendingIntent by lazy {
+        PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -53,7 +64,10 @@ class WorkoutService : Service() {
         if (!observing) {
             observing = true
             val engine = (application as PaceVikingApplication).workoutEngine
-            scope.launch {
+            // Off the main thread: this rebuilds and posts a notification once
+            // per tick, and every notify() is a binder round trip. On the main
+            // thread it competed for frames with the workout screen's clock.
+            scope.launch(Dispatchers.Default) {
                 combine(
                     engine.status, engine.currentPhase, engine.phaseIndex,
                     engine.timeLeftSeconds, engine.isPaused
@@ -67,26 +81,28 @@ class WorkoutService : Service() {
                         val title = "${entry.phase.type.name} — fase ${index + 1}/${engine.phases.value.size}$serie"
                         title to if (paused) "$time$speed (en pausa)" else "$time$speed"
                     }
-                }.collect { content ->
+                }.distinctUntilChanged().collect { content ->
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                     if (content == null) {
-                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                         nm.cancel(PHASE_NOTIFICATION_ID)
-                        ServiceCompat.stopForeground(this@WorkoutService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        // Service lifecycle calls belong on the main thread.
+                        withContext(Dispatchers.Main) {
+                            ServiceCompat.stopForeground(this@WorkoutService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                            stopSelf()
+                        }
                     } else {
-                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                         nm.notify(NOTIFICATION_ID, buildNotification(content.first, content.second))
                     }
                 }
             }
-            scope.launch {
+            scope.launch(Dispatchers.Default) {
                 engine.phaseChanges.collect { (index, entry) ->
                     if (!(application as PaceVikingApplication).isInForeground) {
                         showPhaseChangeNotification(index, entry, engine.phases.value.size)
                     }
                 }
             }
-            scope.launch {
+            scope.launch(Dispatchers.Default) {
                 // Posted regardless of foreground state: it's the record of the
                 // finished session, and it survives the service stopping. The
                 // engine emits this before resetting to IDLE, so it lands
@@ -125,10 +141,6 @@ class WorkoutService : Service() {
     }
 
     private fun buildNotification(title: String, text: String): Notification {
-        val contentIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_workout)
             .setContentTitle(title)
@@ -184,10 +196,6 @@ class WorkoutService : Service() {
     }
 
     private fun alertNotificationBuilder(): NotificationCompat.Builder {
-        val contentIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
         return NotificationCompat.Builder(this, PHASE_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_workout)
             .setContentIntent(contentIntent)

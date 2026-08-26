@@ -8,6 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.FastOutLinearInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -42,9 +43,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.LayoutCoordinates
@@ -55,6 +60,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -64,6 +70,7 @@ import com.example.paceviking.ui.theme.CreateFlash
 import com.example.paceviking.ui.theme.DangerRed
 import com.example.paceviking.ui.theme.DeleteFlash
 import com.example.paceviking.ui.theme.PaceVikingTheme
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableColumn
@@ -882,6 +889,14 @@ private fun formatMmSs(totalSeconds: Int): String =
 
 // Bright accent per phase type, shared by the current-phase texts and the
 // segmented session progress bar.
+// The dark ground each phase type is shown on, paired with [phaseTypeColor].
+private fun phaseBackgroundColor(type: PhaseType): Color = when (type) {
+    PhaseType.WORK -> Color(0xFF33120F)
+    PhaseType.RECOVERY -> Color(0xFF0E2415)
+    PhaseType.WARM_UP -> Color(0xFF0D1F30)
+    PhaseType.COOL_DOWN -> Color(0xFF261230)
+}
+
 private fun phaseTypeColor(type: PhaseType): Color = when (type) {
     PhaseType.WORK -> Color(0xFFFF8A80)
     PhaseType.RECOVERY -> Color(0xFF81C784)
@@ -909,6 +924,8 @@ private fun hrZoneIndex(zone: HrZone): Int? = when (zone) {
     HrZone.NONE -> null
 }
 
+private val METRIC_CARD_CORNER = 16.dp
+
 // One of the two metric cards under the phase type: small label on top, the
 // value below. SpaceBetween + fillMaxHeight keeps both cards' labels and
 // values aligned even though their contents have different heights.
@@ -920,15 +937,20 @@ private fun PhaseMetricCard(
     // The zone card labels itself in its own zone color instead of the phase
     // accent, so the card and the scale below it read as one thing.
     labelColor: Color = accent.copy(alpha = 0.75f),
+    // Goes on the card's contents rather than on the surface, which is where a
+    // whole-card [flashInvert] belongs: the card's own translucent background
+    // must not be part of what the flash recolours, or it would swallow the
+    // block painted behind it. It covers the padding, so it spans the card.
+    contentModifier: Modifier = Modifier,
     value: @Composable ColumnScope.() -> Unit
 ) {
     Surface(
         color = accent.copy(alpha = 0.12f),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(METRIC_CARD_CORNER),
         modifier = modifier.fillMaxHeight()
     ) {
         Column(
-            modifier = Modifier.fillMaxHeight().padding(horizontal = 16.dp, vertical = 10.dp),
+            modifier = contentModifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
@@ -939,6 +961,37 @@ private fun PhaseMetricCard(
             value()
         }
     }
+}
+
+// Phase-change flash. One early warning five seconds out, then a pulse in each
+// of the last two seconds, all in the incoming phase's colour; the change itself
+// lands as one longer flash that fades over the first second of the new phase. A
+// pulse is skipped when its second is not inside the phase (a five-second phase
+// does not warn about its own start), so short phases only get the change flash.
+private val PRE_FLASH_SECONDS = setOf(5, 2, 1)
+private const val PRE_FLASH_UP_MS = 130
+private const val PRE_FLASH_DOWN_MS = 470
+private const val CHANGE_FLASH_MS = 1000
+private const val FLASH_TINT_ALPHA = 0.42f
+// Seconds into the phase at which the speed label pulses on its own — a
+// reminder of the number the treadmill should be at, with no background flash
+// behind it. The first lands as the change flash finishes fading, the second a
+// beat later, for the eyes that came back to the screen too late.
+private val SPEED_REMINDER_SECONDS = setOf(1, 2)
+
+// The muted grey of the secondary lines under the clock.
+private val PreviewGrey = Color(0xFFBDBDBD)
+
+/** A short warning pulse: up fast, back down over the rest of the second. */
+private suspend fun Animatable<Float, AnimationVector1D>.pulse() {
+    animateTo(1f, tween(PRE_FLASH_UP_MS, easing = LinearEasing))
+    animateTo(0f, tween(PRE_FLASH_DOWN_MS, easing = LinearEasing))
+}
+
+/** Full strength at once, then a slow fade — how the change itself lands. */
+private suspend fun Animatable<Float, AnimationVector1D>.flashOut() {
+    snapTo(1f)
+    animateTo(0f, tween(CHANGE_FLASH_MS, easing = LinearEasing))
 }
 
 @Composable
@@ -1035,13 +1088,7 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
     }
 
     // Night-mode palette: dark backgrounds tinted per phase, bright accents on top.
-    val backgroundColor = when (phase?.type) {
-        PhaseType.WORK -> Color(0xFF33120F)
-        PhaseType.RECOVERY -> Color(0xFF0E2415)
-        PhaseType.WARM_UP -> Color(0xFF0D1F30)
-        PhaseType.COOL_DOWN -> Color(0xFF261230)
-        else -> MaterialTheme.colorScheme.background
-    }
+    val backgroundColor = phase?.type?.let(::phaseBackgroundColor) ?: MaterialTheme.colorScheme.background
 
     val phaseColor = phase?.type?.let { phaseTypeColor(it) } ?: MaterialTheme.colorScheme.onBackground
 
@@ -1077,7 +1124,58 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
     )
     val fillColor = phaseColor.copy(alpha = 0.30f)
 
-    Box(modifier = Modifier.fillMaxSize().background(backgroundColor).systemBarsPadding()) {
+    // Three parallel timelines, each read in a draw lambda only — never in this
+    // composable, which is full of text that must not recompose once per frame.
+    // [flash] tints the background on every event; the other two carry the
+    // emphasis, and which one runs says where to look: before the change it is
+    // the preview of what is coming, after it the speed to set right now.
+    val flash = remember { Animatable(0f) }
+    var flashColor by remember { mutableStateOf(phaseColor) }
+    val previewFlash = remember { Animatable(0f) }
+    val speedFlash = remember { Animatable(0f) }
+    val isRunning = status == WorkoutStatus.RUNNING
+
+    // Warning pulses before the change, in the colour of the phase that is
+    // coming, with the emphasis on its preview.
+    LaunchedEffect(currentIdx, timeLeft, isPaused, isRunning) {
+        if (!isRunning || isPaused || timeLeft !in PRE_FLASH_SECONDS) return@LaunchedEffect
+        if (nextPhase == null || phaseDuration <= timeLeft) return@LaunchedEffect
+        flashColor = phaseTypeColor(nextPhase.phase.type)
+        coroutineScope {
+            launch { flash.pulse() }
+            launch { previewFlash.pulse() }
+        }
+    }
+
+    // The change itself, now in the new phase's colour and on its speed. The
+    // first phase is excluded by the index guard: nothing has changed yet when
+    // the workout starts, so its speed is not flashed either.
+    LaunchedEffect(currentIdx) {
+        if (currentIdx <= 0 || !isRunning) return@LaunchedEffect
+        flashColor = phaseColor
+        coroutineScope {
+            launch { flash.flashOut() }
+            launch { speedFlash.flashOut() }
+        }
+    }
+
+    // Once the change flash has faded, the speed alone pulses again, twice —
+    // these land on a screen that is otherwise calm.
+    LaunchedEffect(currentIdx, timeLeft, isPaused, isRunning) {
+        if (!isRunning || isPaused || currentIdx <= 0 || phase?.speedKmh == null) return@LaunchedEffect
+        if (phaseDuration - timeLeft !in SPEED_REMINDER_SECONDS || timeLeft < 1) return@LaunchedEffect
+        speedFlash.pulse()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(backgroundColor)
+            // The flash is a tint over the background, behind every child, so
+            // nothing on screen is covered while it plays.
+            .drawBehind { drawRect(color = flashColor, alpha = flash.value * FLASH_TINT_ALPHA) }
+            .systemBarsPadding()
+    ) {
         Column(
             modifier = Modifier.fillMaxSize().padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -1110,7 +1208,25 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 phase?.speedKmh?.let { speed ->
-                    PhaseMetricCard(label = "VELOCIDAD", accent = phaseColor, modifier = Modifier.weight(1f)) {
+                    PhaseMetricCard(
+                        label = "VELOCIDAD",
+                        accent = phaseColor,
+                        modifier = Modifier.weight(1f),
+                        // The whole card inverts with the flash — label, number
+                        // and unit as one — so the phase change puts the eye on
+                        // the speed to set without showing anything the phase
+                        // does not already show. The pulses *before* a change
+                        // deliberately skip it: until the change lands this is
+                        // still the old speed, and the preview below is what the
+                        // user should be reading.
+                        contentModifier = Modifier.flashInvert(
+                            block = phaseColor,
+                            ink = backgroundColor,
+                            paddingX = 0.dp,
+                            paddingY = 0.dp,
+                            corner = METRIC_CARD_CORNER
+                        ) { speedFlash.value }
+                    ) {
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
                                 text = String.format(Locale.US, "%.1f", speed),
@@ -1196,19 +1312,38 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
 
         if (!isReady) {
             if (nextPhase != null) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // The phase type goes on its own line and every number
-                    // (duration, serie, speed) on the next; the column takes
-                    // exactly the width the button leaves over (weight), so
-                    // SALTAR always keeps its intrinsic size.
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.weight(1f)
+                // The preview is a metric card of its own, dressed in the
+                // incoming phase's colours: the phase type on top, every number
+                // (duration, serie, speed) below. The card takes exactly the
+                // width the button leaves over (weight), so SALTAR always keeps
+                // its intrinsic size, and IntrinsicSize.Min keeps the card the
+                // height of its own contents instead of the whole row.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)
+                ) {
+                    val nextColor = phaseTypeColor(nextPhase.phase.type)
+                    PhaseMetricCard(
+                        label = "SIGUIENTE",
+                        accent = nextColor,
+                        modifier = Modifier.weight(1f),
+                        // Inverted by the warning pulses exactly like the speed
+                        // card is by the change, and in the arriving phase's own
+                        // pair — before a word is read the colours already say
+                        // what is coming.
+                        contentModifier = Modifier.flashInvert(
+                            block = nextColor,
+                            ink = phaseBackgroundColor(nextPhase.phase.type),
+                            paddingX = 0.dp,
+                            paddingY = 0.dp,
+                            corner = METRIC_CARD_CORNER
+                        ) { previewFlash.value }
                     ) {
                         Text(
-                            text = "Siguiente: ${nextPhase.phase.type.name}",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color(0xFFBDBDBD)
+                            text = nextPhase.phase.type.name,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = nextColor
                         )
                         val nextDetails = buildList {
                             add(formatMmSs(nextPhase.phase.durationSeconds))
@@ -1220,19 +1355,21 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
                         Text(
                             text = nextDetails,
                             style = MaterialTheme.typography.titleMedium,
-                            color = Color(0xFFBDBDBD)
+                            color = nextColor.copy(alpha = 0.75f)
                         )
                     }
                     Spacer(modifier = Modifier.width(8.dp))
+                    // In the incoming phase's colour too: the button and the
+                    // card beside it do the same thing, get there sooner.
                     TextButton(onClick = requestSkip) {
-                        Text("SALTAR", fontWeight = FontWeight.Bold, color = phaseColor, maxLines = 1)
+                        Text("SALTAR", fontWeight = FontWeight.Bold, color = nextColor, maxLines = 1)
                     }
                 }
             } else {
                 Text(
                     text = "Última fase",
                     style = MaterialTheme.typography.titleMedium,
-                    color = Color(0xFFBDBDBD)
+                    color = PreviewGrey
                 )
             }
         }
@@ -1332,3 +1469,54 @@ fun WorkoutScreen(viewModel: WorkoutViewModel) {
         }
     }
 }
+
+// Padding and corner of the block a flash paints behind its text. The vertical
+// padding stays small: the preview's two lines each get their own block and
+// must not run into each other.
+private val FLASH_BLOCK_PADDING_X = 8.dp
+private val FLASH_BLOCK_PADDING_Y = 1.dp
+private val FLASH_BLOCK_CORNER = 6.dp
+
+/**
+ * Inverts text while a flash plays: a [block]-coloured slab fills in behind it
+ * as its glyphs fade to [ink], so at full strength font and ground have swapped
+ * — the strongest emphasis available without moving anything on screen. The two
+ * colours are a phase's own pair ([phaseTypeColor] over [phaseBackgroundColor]),
+ * which for the next-phase preview means the flash arrives already wearing the
+ * colours of the phase it is announcing.
+ *
+ * All of it is painted, never composed: the slab is drawn behind the content and
+ * the glyphs are recoloured by blending [ink] over them (SrcAtop, inside an
+ * offscreen layer so nothing underneath is touched), with [flash] read in the
+ * draw lambdas. Passing an interpolated colour down to `Text` instead would
+ * recompose *and* re-measure the text on every frame of the animation.
+ */
+private fun Modifier.flashInvert(
+    block: Color,
+    ink: Color,
+    paddingX: Dp = FLASH_BLOCK_PADDING_X,
+    paddingY: Dp = FLASH_BLOCK_PADDING_Y,
+    corner: Dp = FLASH_BLOCK_CORNER,
+    flash: () -> Float
+): Modifier = this
+    .drawBehind {
+        val boost = flash()
+        if (boost <= 0f) return@drawBehind
+        val padX = paddingX.toPx()
+        val padY = paddingY.toPx()
+        drawRoundRect(
+            color = block,
+            alpha = boost,
+            topLeft = Offset(-padX, -padY),
+            size = Size(size.width + padX * 2, size.height + padY * 2),
+            cornerRadius = CornerRadius(corner.toPx())
+        )
+    }
+    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+    .drawWithContent {
+        drawContent()
+        val boost = flash()
+        if (boost > 0f) {
+            drawRect(color = ink, alpha = boost, blendMode = BlendMode.SrcAtop)
+        }
+    }
