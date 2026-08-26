@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "PaceViking"
 include(":app")
+include(":baselineprofile")
