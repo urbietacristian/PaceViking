@@ -28,6 +28,19 @@ import java.util.Date
 import java.util.Locale
 
 /**
+ * Everything the ongoing notification says that is not the countdown itself.
+ * Deliberately holds no seconds: it is the key `distinctUntilChanged` dedupes
+ * on, so anything in here that changed once a second would cost a notification
+ * post per tick. [speed] is the bare "12.5 km/h" — where the separator goes
+ * depends on whether a frozen time precedes it.
+ */
+private data class OngoingContent(
+    val title: String,
+    val speed: String?,
+    val paused: Boolean
+)
+
+/**
  * Keeps the process (and therefore [WorkoutEngine]'s timer) alive while a
  * workout runs, mirroring the countdown in an ongoing notification. Stops
  * itself when the engine returns to IDLE.
@@ -38,8 +51,11 @@ class WorkoutService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var observing = false
 
-    // Built once: asking ActivityManager for it is a binder call, and the
-    // ongoing notification is rebuilt every second.
+    private val notificationManager: NotificationManager by lazy {
+        getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    }
+
+    // Built once: asking ActivityManager for it is a binder call.
     private val contentIntent: PendingIntent by lazy {
         PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
@@ -60,38 +76,64 @@ class WorkoutService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForegroundCompat(buildNotification("Entrenamiento", "En curso"))
+        startForegroundCompat(buildOngoingNotification("Entrenamiento", "En curso", null))
         if (!observing) {
             observing = true
             val engine = (application as PaceVikingApplication).workoutEngine
-            // Off the main thread: this rebuilds and posts a notification once
-            // per tick, and every notify() is a binder round trip. On the main
-            // thread it competed for frames with the workout screen's clock.
+            // The seconds are deliberately absent from what is combined here.
+            // Keeping them in meant one emission — and one rebuilt, re-parcelled,
+            // re-posted notification — per tick: ~2700 binder round trips over a
+            // 45 minute session, each one waking system_server to re-render the
+            // row. The countdown is handed to the system as a deadline instead
+            // (see [buildOngoingNotification]), which leaves only the phase, the
+            // pause state and the end of the workout to post about.
+            //
+            // Still off the main thread: a notify() is a binder call either way,
+            // and on the main thread it competed for frames with the clock.
             scope.launch(Dispatchers.Default) {
                 combine(
-                    engine.status, engine.currentPhase, engine.phaseIndex,
-                    engine.timeLeftSeconds, engine.isPaused
-                ) { status, entry, index, timeLeft, paused ->
+                    engine.status, engine.currentPhase, engine.phaseIndex, engine.isPaused
+                ) { status, entry, index, paused ->
                     if (status != WorkoutStatus.RUNNING || entry == null) {
                         null
                     } else {
-                        val time = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60)
-                        val speed = entry.phase.speedKmh?.let { String.format(Locale.US, " · %.1f km/h", it) } ?: ""
                         val serie = if (entry.totalRepetitions > 1) " · serie ${entry.repetition}/${entry.totalRepetitions}" else ""
-                        val title = "${entry.phase.type.name} — fase ${index + 1}/${engine.phases.value.size}$serie"
-                        title to if (paused) "$time$speed (en pausa)" else "$time$speed"
+                        OngoingContent(
+                            title = "${entry.phase.type.name} — fase ${index + 1}/${engine.phases.value.size}$serie",
+                            speed = entry.phase.speedKmh?.let { String.format(Locale.US, "%.1f km/h", it) },
+                            paused = paused
+                        )
                     }
                 }.distinctUntilChanged().collect { content ->
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    if (content == null) {
-                        nm.cancel(PHASE_NOTIFICATION_ID)
-                        // Service lifecycle calls belong on the main thread.
-                        withContext(Dispatchers.Main) {
-                            ServiceCompat.stopForeground(this@WorkoutService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                            stopSelf()
+                    when {
+                        content == null -> {
+                            notificationManager.cancel(PHASE_NOTIFICATION_ID)
+                            // Service lifecycle calls belong on the main thread.
+                            withContext(Dispatchers.Main) {
+                                ServiceCompat.stopForeground(this@WorkoutService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                                stopSelf()
+                            }
                         }
-                    } else {
-                        nm.notify(NOTIFICATION_ID, buildNotification(content.first, content.second))
+                        // A paused countdown has no deadline to count towards, so
+                        // the remaining time is read once, here, and written into
+                        // the text where it stays put until the workout resumes.
+                        content.paused -> {
+                            val timeLeft = engine.timeLeftSeconds.value
+                            val time = String.format(Locale.US, "%02d:%02d", timeLeft / 60, timeLeft % 60)
+                            val speed = content.speed?.let { " · $it" } ?: ""
+                            notificationManager.notify(
+                                NOTIFICATION_ID,
+                                buildOngoingNotification(content.title, "$time$speed (en pausa)", null)
+                            )
+                        }
+                        else -> notificationManager.notify(
+                            NOTIFICATION_ID,
+                            buildOngoingNotification(
+                                content.title,
+                                content.speed ?: "En curso",
+                                engine.currentPhaseEndAtMillis()
+                            )
+                        )
                     }
                 }
             }
@@ -108,8 +150,7 @@ class WorkoutService : Service() {
                 // engine emits this before resetting to IDLE, so it lands
                 // before the collector above tears the service down.
                 engine.sessionCompletions.collect { info ->
-                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    nm.notify(COMPLETED_NOTIFICATION_ID, buildCompletedNotification(info))
+                    notificationManager.notify(COMPLETED_NOTIFICATION_ID, buildCompletedNotification(info))
                 }
             }
         }
@@ -140,8 +181,22 @@ class WorkoutService : Service() {
         }
     }
 
-    private fun buildNotification(title: String, text: String): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    /**
+     * The ongoing notification. When [endsAtMillis] is given, the countdown is
+     * rendered by the system as a count-down chronometer against that deadline
+     * — the notification is then posted once, at the start of the phase, and
+     * keeps ticking on its own instead of being re-posted every second. Pass
+     * null for a notification with no live countdown (paused, or the initial
+     * one posted before the engine's state has been read).
+     *
+     * The count-down direction needs API 24, which is the project's minSdk.
+     */
+    private fun buildOngoingNotification(
+        title: String,
+        text: String,
+        endsAtMillis: Long?
+    ): Notification {
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_workout)
             .setContentTitle(title)
             .setContentText(text)
@@ -150,7 +205,16 @@ class WorkoutService : Service() {
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_WORKOUT)
-            .build()
+        return if (endsAtMillis == null) {
+            builder.setShowWhen(false).build()
+        } else {
+            builder
+                .setWhen(endsAtMillis)
+                .setShowWhen(true)
+                .setUsesChronometer(true)
+                .setChronometerCountDown(true)
+                .build()
+        }
     }
 
     /**
@@ -175,11 +239,10 @@ class WorkoutService : Service() {
             .setContentTitle("Nueva fase: ${phase.type.name} (${index + 1}/$totalPhases)$serie")
             .setContentText(details)
             .build()
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         // Cancel first so each phase change posts a brand-new notification,
         // which re-triggers the heads-up popup instead of silently updating.
-        nm.cancel(PHASE_NOTIFICATION_ID)
-        nm.notify(PHASE_NOTIFICATION_ID, notification)
+        notificationManager.cancel(PHASE_NOTIFICATION_ID)
+        notificationManager.notify(PHASE_NOTIFICATION_ID, notification)
     }
 
     private fun buildCompletedNotification(info: CompletedWorkoutInfo): Notification {
@@ -206,11 +269,10 @@ class WorkoutService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(
+            notificationManager.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "Entrenamiento en curso", NotificationManager.IMPORTANCE_LOW)
             )
-            nm.createNotificationChannel(
+            notificationManager.createNotificationChannel(
                 NotificationChannel(
                     PHASE_CHANNEL_ID, "Avisos del entrenamiento", NotificationManager.IMPORTANCE_HIGH
                 ).apply {

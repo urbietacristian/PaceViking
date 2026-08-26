@@ -168,6 +168,23 @@ class WorkoutEngine(context: Context) {
         _completed.value = false
     }
 
+    /**
+     * The instant the current phase is scheduled to end, on the wall clock.
+     *
+     * Read by [WorkoutService] to hand the notification's countdown a deadline
+     * the system can render on its own. It comes off [phaseEndElapsed] — the
+     * same anchor the timer runs on — rather than off `timeLeftSeconds`, which
+     * is rounded up to the second: the notification and the clock on screen
+     * have to agree, and a deadline derived from the rounded value would sit up
+     * to a second away from the real one.
+     *
+     * Meaningless while paused, when the anchor still points at the deadline
+     * the phase had before it stopped ([resume] is what shifts it). The service
+     * shows a frozen time instead and does not ask.
+     */
+    fun currentPhaseEndAtMillis(): Long =
+        System.currentTimeMillis() + (phaseEndElapsed - SystemClock.elapsedRealtime())
+
     private fun startTimer() {
         timerJob?.cancel()
         // Remaining is always recomputed from the phase deadline on the
@@ -190,15 +207,22 @@ class WorkoutEngine(context: Context) {
         alertPhaseChange()
         val nextIndex = _phaseIndex.value + 1
         if (nextIndex < _phases.value.size) {
-            _phaseIndex.value = nextIndex
             val nextPhase = _phases.value[nextIndex]
-            _currentPhase.value = nextPhase
-            _timeLeftSeconds.value = nextPhase.phase.durationSeconds
             // The new deadline is measured from the phase's *scheduled* end,
             // not from the moment this tick actually ran: whatever the timer
             // overshot by is paid back inside this phase instead of being
             // added to the session's total.
+            //
+            // It is advanced before the state below is published, and that
+            // order matters: WorkoutService reads it (through
+            // [currentPhaseEndAtMillis]) off another thread, woken by these
+            // very writes. Each one is a volatile write, so it publishes the
+            // new anchor along with itself; setting the anchor afterwards
+            // would leave the service free to read the old phase's deadline.
             phaseEndElapsed += nextPhase.phase.durationSeconds * 1000L
+            _phaseIndex.value = nextIndex
+            _currentPhase.value = nextPhase
+            _timeLeftSeconds.value = nextPhase.phase.durationSeconds
             _phaseChanges.tryEmit(nextIndex to nextPhase)
             startTimer()
         } else {
