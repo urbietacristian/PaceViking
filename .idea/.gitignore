@@ -1,3 +1,5 @@
 # Default ignored files
 /shelf/
 /workspace.xml
+# Records the serial of whichever physical device was last deployed to.
+/deploymentTargetSelector.xml
