@@ -8,7 +8,9 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface WorkoutDao {
-    @Query("SELECT * FROM sessions ORDER BY id ASC")
+    // id breaks ties so the order stays stable if two sessions ever share an
+    // index (they shouldn't: reorderSessions re-numbers from list position).
+    @Query("SELECT * FROM sessions ORDER BY orderIndex ASC, id ASC")
     fun getAllSessions(): Flow<List<WorkoutSession>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -16,6 +18,19 @@ interface WorkoutDao {
 
     @Delete
     suspend fun deleteSession(session: WorkoutSession)
+
+    /** -1 when there are no sessions, so "+ 1" is the first index. */
+    @Query("SELECT COALESCE(MAX(orderIndex), -1) FROM sessions")
+    suspend fun maxSessionOrderIndex(): Int
+
+    @Query("UPDATE sessions SET orderIndex = :orderIndex WHERE id = :id")
+    suspend fun setSessionOrderIndex(id: Long, orderIndex: Int)
+
+    /** Re-numbers every session from its position in [sessionIds]. */
+    @Transaction
+    suspend fun reorderSessions(sessionIds: List<Long>) {
+        sessionIds.forEachIndexed { index, id -> setSessionOrderIndex(id, index) }
+    }
 
     @Transaction
     @Query("SELECT * FROM blocks WHERE sessionId = :sessionId ORDER BY orderIndex ASC")
@@ -42,7 +57,7 @@ interface WorkoutDao {
     }
 }
 
-@Database(entities = [WorkoutSession::class, WorkoutBlock::class, WorkoutPhase::class], version = 3)
+@Database(entities = [WorkoutSession::class, WorkoutBlock::class, WorkoutPhase::class], version = 4)
 abstract class WorkoutDatabase : RoomDatabase() {
     abstract fun workoutDao(): WorkoutDao
 
@@ -97,6 +112,16 @@ abstract class WorkoutDatabase : RoomDatabase() {
             }
         }
 
+        // User-defined session order. The list used to be sorted by id, so
+        // seeding the new column with it keeps every existing library in the
+        // order its owner already knows.
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE sessions ADD COLUMN orderIndex INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("UPDATE sessions SET orderIndex = id")
+            }
+        }
+
         @Volatile
         private var INSTANCE: WorkoutDatabase? = null
 
@@ -106,7 +131,7 @@ abstract class WorkoutDatabase : RoomDatabase() {
                     context.applicationContext,
                     WorkoutDatabase::class.java,
                     "workout_database"
-                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
                 INSTANCE = instance
                 instance
             }

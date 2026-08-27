@@ -15,10 +15,16 @@ enum class HrZone {
     ZONE_1, ZONE_2, ZONE_3, ZONE_4, ZONE_5, NONE
 }
 
+/**
+ * [orderIndex] is the position the list shows the session in — the user sets it
+ * by dragging in the list's edit mode. A new session is appended past the
+ * current maximum, so insertion order still decides where it lands.
+ */
 @Entity(tableName = "sessions")
 data class WorkoutSession(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val title: String
+    val title: String,
+    val orderIndex: Int = 0
 )
 
 /**

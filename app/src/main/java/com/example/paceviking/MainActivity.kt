@@ -7,6 +7,14 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.FastOutLinearInEasing
@@ -22,6 +30,7 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,8 +44,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,6 +69,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -137,12 +149,26 @@ fun MainNavigation(viewModel: WorkoutViewModel) {
             },
             onEditSession = { viewModel.openEditor(it) },
             onDeleteSession = { viewModel.deleteSession(it) },
+            onReorderSessions = { viewModel.reorderSessions(it) },
             onAddSession = { viewModel.openEditorForNew() },
             onCreateDefaultSession = { viewModel.createDefaultSession() }
         )
     }
 }
 
+/**
+ * The list has two modes.
+ *
+ * Normally a card *is* the session's start button: tapping it — or the play
+ * button that spells that out — loads the workout, and nothing else on the card
+ * competes for the tap. Holding a card down switches the whole list into edit
+ * mode, where every card grows a drag handle and edit and delete buttons, and
+ * stops starting workouts (a tap aimed at one of those buttons must never
+ * launch one). LISTO, or the system back gesture, returns to normal.
+ *
+ * Edit mode is [rememberSaveable] so a rotation doesn't drop the user back into
+ * a list that starts workouts on tap.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionListScreen(
@@ -152,9 +178,11 @@ fun SessionListScreen(
     onStartSession: (WorkoutSession) -> Unit,
     onEditSession: (WorkoutSession) -> Unit,
     onDeleteSession: (WorkoutSession) -> Unit,
+    onReorderSessions: (List<Long>) -> Unit,
     onAddSession: () -> Unit,
     onCreateDefaultSession: () -> Unit
 ) {
+    var editMode by rememberSaveable { mutableStateOf(false) }
     var sessionToDelete by remember { mutableStateOf<WorkoutSession?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -164,6 +192,14 @@ fun SessionListScreen(
             onMessageShown()
         }
     }
+
+    // Deleting the last session would leave edit mode with nothing to act on,
+    // and its empty state is the one that offers to create a session.
+    LaunchedEffect(sessions) {
+        if (sessions?.isEmpty() == true) editMode = false
+    }
+
+    BackHandler(enabled = editMode) { editMode = false }
 
     sessionToDelete?.let { session ->
         AlertDialog(
@@ -183,22 +219,43 @@ fun SessionListScreen(
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("PaceViking - Sesiones") }) },
+        topBar = {
+            TopAppBar(
+                // The normal-mode title doubles as the marker the baseline
+                // profile generator waits for; leave it alone.
+                title = { Text(if (editMode) "Editar sesiones" else "PaceViking - Sesiones") },
+                actions = {
+                    if (editMode) {
+                        TextButton(onClick = { editMode = false }) {
+                            Text("LISTO", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            )
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
-            FloatingActionButton(onClick = onAddSession) {
-                Icon(Icons.Default.Add, contentDescription = "Añadir Sesión")
+            // Edit mode acts on the sessions that exist; creating one is the
+            // normal list's job.
+            AnimatedVisibility(
+                visible = !editMode,
+                enter = scaleIn() + fadeIn(),
+                exit = scaleOut() + fadeOut()
+            ) {
+                FloatingActionButton(onClick = onAddSession) {
+                    Icon(Icons.Default.Add, contentDescription = "Añadir Sesión")
+                }
             }
         }
     ) { padding ->
-        Column(modifier = Modifier.padding(padding).padding(horizontal = 16.dp)) {
+        Box(modifier = Modifier.padding(padding).fillMaxSize()) {
             if (sessions == null) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
             } else if (sessions.isEmpty()) {
                 Column(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
                 ) {
@@ -209,23 +266,157 @@ fun SessionListScreen(
                     }
                 }
             } else {
-                LazyColumn {
-                    items(sessions) { session ->
-                        Card(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).clickable { onStartSession(session) }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(session.title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                                IconButton(onClick = { onEditSession(session) }) {
-                                    Icon(Icons.Default.Edit, contentDescription = "Editar")
-                                }
-                                IconButton(onClick = { sessionToDelete = session }) {
-                                    Icon(Icons.Default.Delete, contentDescription = "Eliminar", tint = DangerRed)
-                                }
-                            }
+                SessionList(
+                    sessions = sessions,
+                    editMode = editMode,
+                    onStartSession = onStartSession,
+                    onEnterEditMode = { editMode = true },
+                    onEditSession = onEditSession,
+                    onDeleteRequest = { sessionToDelete = it },
+                    onReorderSessions = onReorderSessions
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionList(
+    sessions: List<WorkoutSession>,
+    editMode: Boolean,
+    onStartSession: (WorkoutSession) -> Unit,
+    onEnterEditMode: () -> Unit,
+    onEditSession: (WorkoutSession) -> Unit,
+    onDeleteRequest: (WorkoutSession) -> Unit,
+    onReorderSessions: (List<Long>) -> Unit
+) {
+    // The database owns the order, but a drag has to reorder the list under the
+    // finger long before any write could land: onMove edits this copy, and the
+    // finger lifting persists it as one write. Nothing else touches the
+    // sessions table while this screen is up, so the flow can only re-emit
+    // *after* that write — carrying the order already on screen, which is why
+    // re-syncing from it here can never snap a dragged card back.
+    var ordered by remember { mutableStateOf(sessions) }
+    LaunchedEffect(sessions) { ordered = sessions }
+
+    val haptics = LocalHapticFeedback.current
+    val listState = rememberLazyListState()
+    val reorderState = rememberReorderableLazyListState(listState) { from, to ->
+        // The hint footer only exists outside edit mode, and dragging only
+        // inside it, so lazy indices are session indices here.
+        ordered = ordered.toMutableList().apply { add(to.index, removeAt(from.index)) }
+        haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        contentPadding = PaddingValues(vertical = 8.dp)
+    ) {
+        items(ordered, key = { it.id }) { session ->
+            ReorderableItem(reorderState, key = session.id) { _ ->
+                // draggableHandle() resolves against this ReorderableItem's
+                // scope, so the handle has to be built here and handed down.
+                val handle: @Composable () -> Unit = {
+                    IconButton(
+                        onClick = {},
+                        modifier = Modifier.draggableHandle(
+                            onDragStarted = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) },
+                            onDragStopped = { onReorderSessions(ordered.map { it.id }) }
+                        )
+                    ) {
+                        Icon(Icons.Default.DragHandle, contentDescription = "Reordenar", tint = Color.Gray)
+                    }
+                }
+                SessionCard(
+                    session = session,
+                    editMode = editMode,
+                    onStart = { onStartSession(session) },
+                    onLongPress = onEnterEditMode,
+                    onEdit = { onEditSession(session) },
+                    onDelete = { onDeleteRequest(session) },
+                    dragHandle = handle
+                )
+            }
+        }
+
+        if (!editMode) {
+            // Long press is the only way into edit mode, and nothing on screen
+            // would otherwise say so.
+            item(key = SESSION_LIST_HINT) {
+                Text(
+                    text = "Mantén pulsada una sesión para editarla, borrarla o reordenarla.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 88.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionCard(
+    session: WorkoutSession,
+    editMode: Boolean,
+    onStart: () -> Unit,
+    onLongPress: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    dragHandle: @Composable () -> Unit
+) {
+    val haptics = LocalHapticFeedback.current
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+            .combinedClickable(
+                // In edit mode the card's own buttons are the only actions:
+                // a tap that misses one must not start a workout instead.
+                enabled = !editMode,
+                onClick = onStart,
+                onLongClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onLongPress()
+                },
+                onClickLabel = "Iniciar sesión",
+                onLongClickLabel = "Editar sesiones"
+            )
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 72.dp).padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            AnimatedVisibility(
+                visible = editMode,
+                enter = fadeIn() + expandHorizontally(),
+                exit = fadeOut() + shrinkHorizontally()
+            ) {
+                dragHandle()
+            }
+            Text(
+                text = session.title,
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+            )
+            // The trailing controls swap wholesale: play in normal mode, edit
+            // and delete in edit mode.
+            AnimatedContent(targetState = editMode, label = "acciones-sesión") { editing ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (editing) {
+                        IconButton(onClick = onEdit) {
+                            Icon(Icons.Default.Edit, contentDescription = "Editar")
+                        }
+                        IconButton(onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.Reject)
+                            onDelete()
+                        }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Eliminar", tint = DangerRed)
+                        }
+                    } else {
+                        FilledIconButton(onClick = onStart) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "Iniciar")
                         }
                     }
                 }
@@ -233,6 +424,8 @@ fun SessionListScreen(
         }
     }
 }
+
+private const val SESSION_LIST_HINT = "session-list-hint"
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable

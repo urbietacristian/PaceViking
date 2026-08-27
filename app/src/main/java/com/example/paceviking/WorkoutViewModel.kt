@@ -125,13 +125,28 @@ class WorkoutViewModel(application: Application) : AndroidViewModel(application)
                     phases = block.phases.mapIndexed { phaseIdx, p -> p.copy(orderIndex = phaseIdx) }
                 )
             }
-            dao.updateSessionWithBlocks(session, ordered)
+            // A brand-new session goes after everything already in the list; an
+            // existing one keeps the position it was dragged to.
+            val toSave =
+                if (session.id == 0L) session.copy(orderIndex = dao.maxSessionOrderIndex() + 1) else session
+            dao.updateSessionWithBlocks(toSave, ordered)
         }
     }
 
     fun deleteSession(session: WorkoutSession) {
         viewModelScope.launch {
             dao.deleteSession(session)
+        }
+    }
+
+    /**
+     * Persists the order the list was dragged into: position becomes
+     * orderIndex. Called once the finger lifts, not on every move, so a drag
+     * across the list is one write.
+     */
+    fun reorderSessions(orderedIds: List<Long>) {
+        viewModelScope.launch {
+            dao.reorderSessions(orderedIds)
         }
     }
 
